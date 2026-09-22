@@ -13,7 +13,7 @@
       3. Query CURRENT DHCP role/service/scope state.
       4. LOCK removal if DHCP scopes cannot be queried.
       5. LOCK removal if active IPv4 scopes exist.
-      6. Require explicit per-server confirmation.
+      6. Require explicit per-server confirmation unless bypass is enabled.
       7. Remove DHCP role WITHOUT rebooting.
       8. Verify DHCP Windows Feature removal.
       9. Remove:
@@ -38,9 +38,10 @@
 
     Recommended:
 
-        $AllowActiveScopeOverride = $false
-        $RemoveDHCPAuthorization  = $false
-        $OfferRebootAtEnd         = $true
+        $AllowActiveScopeOverride      = $false
+        $BypassPerServerConfirmation   = $false
+        $RemoveDHCPAuthorization       = $false
+        $OfferRebootAtEnd              = $true
 #>
 
 
@@ -59,6 +60,16 @@ $CSVFile = ".\Domain-DHCP-Audit.csv"
 # ------------------------------------------------------------
 
 $AllowActiveScopeOverride = $false
+
+
+# When $true, skips the per-server prompt:
+#
+#     Type REMOVE-<ServerName> to continue
+#
+# The initial REMOVE-DHCP confirmation, active-scope safety lock,
+# and end-of-run reboot confirmation are NOT bypassed.
+#
+$BypassPerServerConfirmation = $false
 
 
 # ------------------------------------------------------------
@@ -1019,42 +1030,53 @@ $Results = foreach (
         Write-Host ""
 
 
-        $ServerConfirmation = Read-Host `
-            "Type REMOVE-$Server to continue"
-
-
         if (
-            $ServerConfirmation -cne
-            "REMOVE-$Server"
+            $BypassPerServerConfirmation
         ) {
 
-            [PSCustomObject]@{
+            Write-Host "Per-server confirmation bypass enabled." `
+                -ForegroundColor Yellow
+        }
 
-                Server = $Server
-                Action = "Skipped"
-                Result = "Operator Cancelled"
+        else {
 
-                RoleBefore = "Installed"
-                ServiceBefore = "Installed"
+            $ServerConfirmation = Read-Host `
+                "Type REMOVE-$Server to continue"
 
-                ServiceStatus = $DHCP.ServiceStatus
 
-                ScopeCount = $DHCP.ScopeCount
-                ActiveScopes = $DHCP.ActiveScopeCount
+            if (
+                $ServerConfirmation -cne
+                "REMOVE-$Server"
+            ) {
 
-                RoleAfter = "Installed"
-                ServiceAfter = $DHCP.ServiceStatus
+                [PSCustomObject]@{
 
-                Shortcut = "Not Removed"
+                    Server = $Server
+                    Action = "Skipped"
+                    Result = "Operator Cancelled"
 
-                RebootRequired = "No"
+                    RoleBefore = "Installed"
+                    ServiceBefore = "Installed"
 
-                Authorization = $Target.Authorized
+                    ServiceStatus = $DHCP.ServiceStatus
 
-                Notes = ""
+                    ScopeCount = $DHCP.ScopeCount
+                    ActiveScopes = $DHCP.ActiveScopeCount
+
+                    RoleAfter = "Installed"
+                    ServiceAfter = $DHCP.ServiceStatus
+
+                    Shortcut = "Not Removed"
+
+                    RebootRequired = "No"
+
+                    Authorization = $Target.Authorized
+
+                    Notes = ""
+                }
+
+                continue
             }
-
-            continue
         }
 
 
