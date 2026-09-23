@@ -7,19 +7,16 @@
     Workflow:
 
       1. Read servers from DHCP-Servers-Requiring-Reboot.csv.
-      2. Verify WinRM connectivity.
-      3. Record the current Windows LastBootUpTime.
-      4. Display servers approved for reboot.
-      5. Require REBOOT-ALL confirmation.
-      6. Send reboot commands to all approved servers.
-      7. Monitor all servers together.
-      8. Verify each server actually rebooted by checking LastBootUpTime.
-      9. Wait for Windows to settle.
-     10. Verify:
+      2. Display all servers found in the CSV.
+      3. Require REBOOT-ALL confirmation.
+      4. Send reboot commands to all servers.
+      5. Monitor all rebooted servers together for WinRM.
+      6. Wait for Windows to settle.
+      7. Verify:
              DHCP role       = Not Installed
              DHCPServer svc  = Not Installed
              DHCP shortcut   = Not Present
-     11. Export verification results to CSV.
+      8. Export verification results to CSV.
 
 .NOTES
     The script does not modify or delete the original
@@ -79,30 +76,6 @@ function Test-RemoteWinRM {
 
 
 # ============================================================
-# FUNCTION: GET LAST BOOT TIME
-# ============================================================
-
-function Get-RemoteLastBootTime {
-
-    param (
-        [Parameter(Mandatory)]
-        [string]$ComputerName
-    )
-
-    Invoke-Command `
-        -ComputerName $ComputerName `
-        -ErrorAction Stop `
-        -ScriptBlock {
-
-            (Get-CimInstance `
-                -ClassName Win32_OperatingSystem `
-                -ErrorAction Stop
-            ).LastBootUpTime
-        }
-}
-
-
-# ============================================================
 # FUNCTION: POST-REBOOT DHCP VERIFICATION
 # ============================================================
 
@@ -150,15 +123,8 @@ function Get-PostRebootDHCPVerification {
             $ShortcutPresent = Test-Path `
                 -LiteralPath $ShortcutPath
 
-            $LastBootUpTime = (
-                Get-CimInstance `
-                    -ClassName Win32_OperatingSystem `
-                    -ErrorAction Stop
-            ).LastBootUpTime
-
             [PSCustomObject]@{
                 ComputerName    = $env:COMPUTERNAME
-                LastBootUpTime  = $LastBootUpTime
                 RoleInstalled   = $RoleInstalled
                 ServiceInstalled = $ServiceInstalled
                 ServiceStatus   = $ServiceStatus
@@ -208,69 +174,6 @@ if ($Servers.Count -eq 0) {
 
 
 # ============================================================
-# PRE-REBOOT CHECK
-# ============================================================
-
-Write-Host ""
-Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "                 PRE-REBOOT CHECK" -ForegroundColor Cyan
-Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host ""
-
-$PreRebootResults = foreach ($Server in $Servers) {
-
-    Write-Host "Checking $Server..." -ForegroundColor Cyan
-
-    if (-not (Test-RemoteWinRM -ComputerName $Server)) {
-
-        Write-Host "  WinRM unavailable." -ForegroundColor Red
-
-        [PSCustomObject]@{
-            Server            = $Server
-            WinRM             = "Unavailable"
-            LastBootUpTime    = $null
-            ApprovedForReboot = $false
-        }
-
-        continue
-    }
-
-    try {
-
-        $LastBootTime = Get-RemoteLastBootTime -ComputerName $Server
-
-        Write-Host "  WinRM available." -ForegroundColor Green
-        Write-Host "  Last boot: $LastBootTime" -ForegroundColor Gray
-
-        [PSCustomObject]@{
-            Server            = $Server
-            WinRM             = "Available"
-            LastBootUpTime    = $LastBootTime
-            ApprovedForReboot = $true
-        }
-    }
-    catch {
-
-        Write-Host "  Unable to retrieve LastBootUpTime." -ForegroundColor Red
-
-        [PSCustomObject]@{
-            Server            = $Server
-            WinRM             = "Available"
-            LastBootUpTime    = $null
-            ApprovedForReboot = $false
-        }
-    }
-}
-
-$ServersToReboot = @(
-    $PreRebootResults |
-        Where-Object {
-            $_.ApprovedForReboot -eq $true
-        }
-)
-
-
-# ============================================================
 # DISPLAY SERVERS
 # ============================================================
 
@@ -280,22 +183,13 @@ Write-Host "                  SERVERS TO REBOOT" -ForegroundColor Red
 Write-Host "============================================================" -ForegroundColor Red
 Write-Host ""
 
-$ServersToReboot |
-    Format-Table Server, WinRM, LastBootUpTime -AutoSize
+$Servers | ForEach-Object {
+    Write-Host "  $_" -ForegroundColor Yellow
+}
 
 Write-Host ""
-Write-Host "Servers in CSV       : $($Servers.Count)"
-Write-Host "Approved for reboot  : $($ServersToReboot.Count)" -ForegroundColor Yellow
-Write-Host "Unable to reboot     : $($Servers.Count - $ServersToReboot.Count)"
-
-if ($ServersToReboot.Count -eq 0) {
-
-    Write-Host ""
-    Write-Host "No servers are available for reboot." -ForegroundColor Red
-    Write-Host ""
-
-    exit 1
-}
+Write-Host "Servers in CSV       : $($Servers.Count)" -ForegroundColor Cyan
+Write-Host ""
 
 
 # ============================================================
@@ -328,9 +222,7 @@ Write-Host "                 SENDING REBOOTS" -ForegroundColor Yellow
 Write-Host "============================================================" -ForegroundColor Yellow
 Write-Host ""
 
-$RebootResults = foreach ($Item in $ServersToReboot) {
-
-    $Server = $Item.Server
+$RebootResults = foreach ($Server in $Servers) {
 
     try {
 
@@ -345,7 +237,6 @@ $RebootResults = foreach ($Item in $ServersToReboot) {
 
         [PSCustomObject]@{
             Server                = $Server
-            PreRebootLastBootTime = $Item.LastBootUpTime
             RebootCommand         = "Sent"
         }
     }
@@ -356,7 +247,6 @@ $RebootResults = foreach ($Item in $ServersToReboot) {
 
         [PSCustomObject]@{
             Server                = $Server
-            PreRebootLastBootTime = $Item.LastBootUpTime
             RebootCommand         = "Failed"
         }
     }
@@ -399,10 +289,7 @@ $PendingServers = @{}
 
 foreach ($Item in $ServersActuallyRebooted) {
 
-    $PendingServers[$Item.Server] = [PSCustomObject]@{
-        Server                = $Item.Server
-        PreRebootLastBootTime = $Item.PreRebootLastBootTime
-    }
+    $PendingServers[$Item.Server] = $true
 }
 
 $MonitorTimer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -414,30 +301,14 @@ while (
 
     foreach ($Server in @($PendingServers.Keys)) {
 
-        if (-not (Test-RemoteWinRM -ComputerName $Server)) {
+        if (Test-RemoteWinRM -ComputerName $Server) {
+
+            Write-Host "$Server : WinRM available" -ForegroundColor Green
+            $PendingServers.Remove($Server)
+        }
+        else {
 
             Write-Host "$Server : waiting for WinRM..." -ForegroundColor Gray
-            continue
-        }
-
-        try {
-
-            $CurrentBootTime = Get-RemoteLastBootTime -ComputerName $Server
-            $PreviousBootTime = $PendingServers[$Server].PreRebootLastBootTime
-
-            if ($CurrentBootTime -gt $PreviousBootTime) {
-
-                Write-Host "$Server : reboot confirmed, WinRM available" -ForegroundColor Green
-                $PendingServers.Remove($Server)
-            }
-            else {
-
-                Write-Host "$Server : WinRM available, waiting for reboot..." -ForegroundColor Yellow
-            }
-        }
-        catch {
-
-            Write-Host "$Server : WinRM available, boot-time check failed..." -ForegroundColor Yellow
         }
     }
 
@@ -490,7 +361,7 @@ $PostRebootResults = foreach ($Item in $ServersActuallyRebooted) {
     if ($PendingServers.ContainsKey($Server)) {
 
         Write-Host ""
-        Write-Host "TIMEOUT: Unable to confirm completed reboot." -ForegroundColor Red
+        Write-Host "TIMEOUT: Server did not return through WinRM." -ForegroundColor Red
 
         [PSCustomObject]@{
             Server       = $Server
@@ -500,7 +371,7 @@ $PostRebootResults = foreach ($Item in $ServersActuallyRebooted) {
             DHCPService  = "Unable to Verify"
             Shortcut     = "Unable to Verify"
             Verification = "FAILED"
-            Notes        = "Unable to confirm reboot before timeout"
+            Notes        = "Server did not return through WinRM before timeout"
         }
 
         continue
@@ -533,12 +404,7 @@ $PostRebootResults = foreach ($Item in $ServersActuallyRebooted) {
             "Not Present"
         }
 
-        $RebootConfirmed = (
-            $Verify.LastBootUpTime -gt $Item.PreRebootLastBootTime
-        )
-
         $VerificationPassed = (
-            $RebootConfirmed -and
             -not $Verify.RoleInstalled -and
             -not $Verify.ServiceInstalled -and
             -not $Verify.ShortcutPresent
@@ -560,15 +426,14 @@ $PostRebootResults = foreach ($Item in $ServersActuallyRebooted) {
         }
 
         Write-Host ""
-        Write-Host "  Reboot:        $(if ($RebootConfirmed) { 'Confirmed' } else { 'NOT CONFIRMED' })"
-        Write-Host "  Last Boot:     $($Verify.LastBootUpTime)"
+        Write-Host "  Reboot:        Returned through WinRM"
         Write-Host "  DHCP Role:     $RoleResult"
         Write-Host "  DHCP Service:  $ServiceResult"
         Write-Host "  DHCP Shortcut: $ShortcutResult"
 
         [PSCustomObject]@{
             Server       = $Server
-            Reboot       = if ($RebootConfirmed) { "Confirmed" } else { "Not Confirmed" }
+            Reboot       = "Returned"
             WinRM        = "Available"
             DHCPRole     = $RoleResult
             DHCPService  = $ServiceResult
