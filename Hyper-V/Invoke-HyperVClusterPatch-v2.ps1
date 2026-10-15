@@ -76,6 +76,15 @@
     WinRM session operation timeout in seconds (default 60). This is not
     a guaranteed wall-clock timeout for every remote call.
 
+.PARAMETER AllowedCauWarningRuleIds
+    Optional explicit CAU warning-rule exceptions, for example 10,11.
+    Only rules whose latest state is Failed AND severity is Warning may
+    be excepted. All failed Error/Critical rules and any other failed
+    warning rule still block scan and patch modes. Every exception is
+    logged in the CAU readiness CSV and summary JSON. Review Rule 10
+    proxy settings and Rule 11 self-updating role relevance first.
+    Default: no exceptions. PreCheckOnly never needs exceptions.
+
 .PARAMETER RequireSmbEncryption
     Passes the SMB encryption requirement to the HotfixPlugin. Default true.
     The share must be configured to support the chosen setting.
@@ -92,12 +101,19 @@
     # Manually authorize patching with a typed cluster-name confirmation
     .\Invoke-HyperVClusterPatch-v2.ps1 -ClusterName HVCLUS01 -SourceFolder D:\Patches\2026-10 -HotfixRoot \\FS01\CAU\HVCLUS01 -ExpectedBuild 26100.XXXX
 
+.EXAMPLE
+    # After separately verifying warnings 10/11 are acceptable in your environment
+    .\Invoke-HyperVClusterPatch-v2.ps1 -ClusterName HVCLUS01 -SourceFolder D:\Patches\2026-10 -HotfixRoot \\FS01\CAU\HVCLUS01 -ScanOnly -AllowedCauWarningRuleIds 10,11
+
 .NOTES
     STATUS: DEVELOPMENT / LAB TEST REQUIRED.
     CAU readiness rules and scan summary are exported separately. Failed
     rules are warnings in PreCheckOnly, but block scan and patch modes.
     Rule 10 (machine proxy) and Rule 11 (CAU clustered role) require
-    operator review; no automatic proxy or clustered-role changes occur.
+    operator review. To allow only these two warning-level failures for
+    a manually initiated, staged-MSU workflow, specify:
+      -AllowedCauWarningRuleIds 10,11
+    No automatic proxy or clustered-role changes occur.
     A successful CAU scan does not mean every readiness rule passed.
     PowerShell 7 can import clustering commands via WinPSCompatSession; the
     resulting objects may be deserialized. V2 checks property availability
@@ -155,7 +171,8 @@ param(
  [ValidateRange(30,480)][int]$InstallerTimeoutMinutes=120,
  [bool]$RequireSmbEncryption=$true,
  [ValidateRange(5,120)][int]$WinRMConnectTimeoutSeconds=15,
- [ValidateRange(10,300)][int]$WinRMOperationTimeoutSeconds=60
+ [ValidateRange(10,300)][int]$WinRMOperationTimeoutSeconds=60,
+ [int[]]$AllowedCauWarningRuleIds=@()
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -290,6 +307,9 @@ function Test-Preflight([string]$Name) {
    RuleId=$_.RuleId; Title=$_.Title; State=[string]$_.State
    Severity=[string]$_.Severity
    FailedMachines=([string]::Join(', ',@($_.FailedMachines)))
+   ExceptionApplied=($null -ne $_.PSObject.Properties['Severity'] -and
+    [string]$_.State -eq 'Failed' -and [string]$_.Severity -eq 'Warning' -and
+    [int]$_.RuleId -in $AllowedCauWarningRuleIds)
   }
  })
  $cauRows | Export-Csv (Join-Path $reportDir 'cau-readiness-rules.csv') -NoTypeInformation
@@ -297,11 +317,18 @@ function Test-Preflight([string]$Name) {
  foreach($rule in $failedRules) {
   Write-Warning ("CAU rule {0}: {1}; severity={2}; affected={3}" -f $rule.RuleId,$rule.Title,$rule.Severity,$rule.FailedMachines)
  }
+ $exceptedRules=@($failedRules | Where-Object ExceptionApplied)
+ $blockingRules=@($failedRules | Where-Object { -not $_.ExceptionApplied })
+ foreach($rule in $exceptedRules) {
+  Write-Warning ("CAU rule {0} explicitly excepted (warning only): {1}" -f $rule.RuleId,$rule.Title)
+ }
  $scanSuccess=@($summaries | Where-Object { $_.Success -eq $true }).Count -gt 0
  $scanFailed=@($summaries | Where-Object { $_.Success -eq $false }).Count -gt 0
  [pscustomobject]@{
   ScanReportedSuccess=$scanSuccess; ScanReportedFailure=$scanFailed
   RuleCount=$cauRows.Count; FailedRuleCount=$failedRules.Count
+  ExceptedRuleCount=$exceptedRules.Count; BlockingRuleCount=$blockingRules.Count
+  AllowedCauWarningRuleIds=@($AllowedCauWarningRuleIds)
   SummaryCount=$summaries.Count
  } | ConvertTo-Json | Set-Content (Join-Path $reportDir 'cau-readiness-summary.json')
  Assert-Ready ($cauRows.Count -gt 0) 'CAU returned no recognizable rule results'
@@ -310,7 +337,7 @@ function Test-Preflight([string]$Name) {
  # failed rule in scan/patch mode until the environment has been reviewed.
  if(-not $PreCheckOnly) {
   Assert-Ready ($scanSuccess) 'CAU setup did not report successful completion'
-  Assert-Ready ($failedRules.Count -eq 0) 'CAU readiness rules failed. Review cau-readiness-rules.csv before staging or patching.'
+  Assert-Ready ($blockingRules.Count -eq 0) 'Unexcepted CAU readiness rules failed. Review cau-readiness-rules.csv before staging or patching.'
  }
  Write-Phase 'Estimating N-1 evacuation capacity'
  Test-Evacuation -Names $script:nodes -Snapshot $script:before
