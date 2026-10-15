@@ -68,6 +68,14 @@
     HotfixPlugin installer timeout per node, default 120 minutes.
     Validate plugin support and behavior in your Server 2025 environment.
 
+.PARAMETER WinRMConnectTimeoutSeconds
+    WinRM session open timeout in seconds (default 15). Does not cover
+    CIM/cluster/CAU cmdlets or all OS-level hangs.
+
+.PARAMETER WinRMOperationTimeoutSeconds
+    WinRM session operation timeout in seconds (default 60). This is not
+    a guaranteed wall-clock timeout for every remote call.
+
 .PARAMETER RequireSmbEncryption
     Passes the SMB encryption requirement to the HotfixPlugin. Default true.
     The share must be configured to support the chosen setting.
@@ -86,6 +94,9 @@
 
 .NOTES
     STATUS: DEVELOPMENT / LAB TEST REQUIRED.
+    PowerShell 7 can import clustering commands via WinPSCompatSession; the
+    resulting objects may be deserialized. V2 checks property availability
+    explicitly and records the preflight phase for diagnosis.
 
     Prerequisites:
       - Windows PowerShell with FailoverClusters, ClusterAwareUpdating,
@@ -108,6 +119,8 @@
       - No unattended scheduling, multi-cluster orchestration, automatic
         forced reboot, or automatic rollback is provided.
       - Report collection is best effort, including on failures.
+      - WinRM session timeouts bound remoting operations, but cannot bound every
+        CIM, cluster cmdlet, CAU call, or server-side hung operation.
       - CAU command compatibility and post-run success criteria require
         lab verification before any production use.
       - Avoid overlapping patch operations against the same CAU share.
@@ -134,7 +147,9 @@ param(
  [string]$ReportFolder=(Join-Path $PSScriptRoot 'PatchReports'),
  [ValidateRange(5,50)][int]$MemoryReservePercent=20,
  [ValidateRange(30,480)][int]$InstallerTimeoutMinutes=120,
- [bool]$RequireSmbEncryption=$true
+ [bool]$RequireSmbEncryption=$true,
+ [ValidateRange(5,120)][int]$WinRMConnectTimeoutSeconds=15,
+ [ValidateRange(10,300)][int]$WinRMOperationTimeoutSeconds=60
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -147,15 +162,29 @@ $before=@()
 $after=@()
 $started=$false
 $failure=$null
+$phase='Initialization'
 
+function Write-Phase([string]$Message) {
+ $script:phase=$Message
+ Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'),$Message) -ForegroundColor Cyan
+}
+function Get-PropertyText($Item,[string]$Property,[string]$Context) {
+ $p=$Item.PSObject.Properties[$Property]
+ if($null -eq $p) {
+  throw "Missing property '$Property' in $Context. Object type: $($Item.GetType().FullName); properties: $(($Item.PSObject.Properties.Name) -join ', ')"
+ }
+ return [string]$p.Value
+}
 function Assert-Ready([bool]$Condition,[string]$Message) {
  if(-not $Condition) { throw $Message }
 }
 function Get-NodeSnapshot([string[]]$Names) {
  $results=@()
  foreach($name in $Names) {
+  Write-Phase "Remote node inventory: $name"
   try {
-   $r=Invoke-Command -ComputerName $name -ErrorAction Stop -ScriptBlock {
+   $sessionOption=New-PSSessionOption -OpenTimeout ($WinRMConnectTimeoutSeconds*1000) -OperationTimeout ($WinRMOperationTimeoutSeconds*1000)
+   $r=Invoke-Command -ComputerName $name -SessionOption $sessionOption -ErrorAction Stop -ScriptBlock {
     $cv=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     $os=Get-CimInstance Win32_OperatingSystem
     [pscustomobject]@{
@@ -168,19 +197,19 @@ function Get-NodeSnapshot([string[]]$Names) {
    }
    Assert-Ready ($null -ne $r) "No response from $name"
    $results+=($r | Select-Object Node,Build,LastBoot,FreeMemoryBytes,PendingReboot)
-  } catch { throw "Remote inventory failed on $name : $_" }
+  } catch { throw "Remote inventory failed on $name (phase: $script:phase): $_" }
  }
  return @($results)
 }
 function Get-ClusterHealth([string]$Name) {
  $csv=@(Get-ClusterSharedVolume -Cluster $Name)
- $roles=@(Get-ClusterGroup -Cluster $Name | Where-Object GroupType -eq 'VirtualMachine')
+ $roles=@(Get-ClusterGroup -Cluster $Name | Where-Object { (Get-PropertyText $_ 'GroupType' 'cluster group') -eq 'VirtualMachine' })
  [pscustomobject]@{
   Timestamp=Get-Date
   Cluster=$Name
   CSVs=@($csv | Select-Object Name,State,OwnerNode)
-  VMNotOnline=@($roles | Where-Object State -ne 'Online' | Select-Object Name,State,OwnerNode)
-  FailedResources=@(Get-ClusterResource -Cluster $Name | Where-Object State -eq 'Failed' | Select-Object Name,State)
+  VMNotOnline=@($roles | Where-Object { (Get-PropertyText $_ 'State' 'VM cluster group') -ne 'Online' } | Select-Object Name,State,OwnerNode)
+  FailedResources=@(Get-ClusterResource -Cluster $Name | Where-Object { (Get-PropertyText $_ 'State' 'cluster resource') -eq 'Failed' } | Select-Object Name,State)
  }
 }
 function Test-Evacuation([string[]]$Names,[object[]]$Snapshot) {
@@ -189,6 +218,7 @@ function Test-Evacuation([string[]]$Names,[object[]]$Snapshot) {
  $free=@{}
  $vms=@{}
  foreach($n in $Names) {
+  Write-Phase "Hyper-V VM inventory: $n"
   $free[$n]=[double](@($Snapshot | Where-Object Node -eq $n)[0].FreeMemoryBytes)*(1-$MemoryReservePercent/100)
   $vms[$n]=@(Get-VM -ComputerName $n | Where-Object State -eq 'Running')
  }
@@ -203,21 +233,27 @@ function Test-Evacuation([string[]]$Names,[object[]]$Snapshot) {
  }
 }
 function Test-Preflight([string]$Name) {
+ Write-Phase 'Discovering cluster nodes'
  $clusterNodes=@(Get-ClusterNode -Cluster $Name)
  Assert-Ready ($clusterNodes.Count -ge 3) 'Expected at least three nodes'
- Assert-Ready (@($clusterNodes | Where-Object State -ne 'Up').Count -eq 0) 'Cluster has a node not Up'
+ Assert-Ready (@($clusterNodes | Where-Object { (Get-PropertyText $_ 'State' 'cluster node') -ne 'Up' }).Count -eq 0) 'Cluster has a node not Up'
  $script:nodes=@($clusterNodes | ForEach-Object Name)
+ Write-Phase 'Checking CSV health'
  $csv=@(Get-ClusterSharedVolume -Cluster $Name)
  Assert-Ready ($csv.Count -gt 0) 'No Cluster Shared Volumes found'
- Assert-Ready (@($csv | Where-Object State -ne 'Online').Count -eq 0) 'CSV not Online'
+ Assert-Ready (@($csv | Where-Object { (Get-PropertyText $_ 'State' 'CSV') -ne 'Online' }).Count -eq 0) 'CSV not Online'
+ Write-Phase 'Checking cluster resources and VM roles'
  $health=Get-ClusterHealth $Name
  Assert-Ready ($health.FailedResources.Count -eq 0) 'Failed cluster resources detected'
  Assert-Ready ($health.VMNotOnline.Count -eq 0) 'A clustered VM role is not Online'
+ Write-Phase 'Collecting node health via WinRM'
  $script:before=@(Get-NodeSnapshot -Names $script:nodes)
  Assert-Ready ($script:before.Count -eq $script:nodes.Count) 'Incomplete node inventory'
  Assert-Ready (@($script:before | Where-Object PendingReboot).Count -eq 0) 'Pending reboot detected'
+ Write-Phase 'Running Test-CauSetup (may take several minutes)'
  $test=@(Test-CauSetup -ClusterName $Name)
- Assert-Ready (@($test | Where-Object State -eq 'Failed').Count -eq 0) 'CAU setup failed'
+ Assert-Ready (@($test | Where-Object { (Get-PropertyText $_ 'State' 'CAU setup result') -eq 'Failed' }).Count -eq 0) 'CAU setup failed'
+ Write-Phase 'Estimating N-1 evacuation capacity'
  Test-Evacuation -Names $script:nodes -Snapshot $script:before
  $health | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $reportDir 'cluster-before.json')
  $script:before | Export-Csv (Join-Path $reportDir 'nodes-before.csv') -NoTypeInformation
@@ -258,7 +294,15 @@ function Stage-ApprovedPackages([object[]]$Files,[string]$Root) {
 try {
  Start-Transcript -Path (Join-Path $reportDir 'transcript.log') | Out-Null
  $transcribing=$true
- foreach($module in 'FailoverClusters','ClusterAwareUpdating','Hyper-V') { Import-Module $module -ErrorAction Stop }
+ Write-Phase "PowerShell $($PSVersionTable.PSVersion); importing required modules"
+ foreach($module in 'FailoverClusters','ClusterAwareUpdating','Hyper-V') {
+  Write-Phase "Importing $module"
+  Import-Module $module -ErrorAction Stop
+ }
+ Write-Phase 'Validating CAU commands'
+ foreach($cmd in 'Test-CauSetup','Invoke-CauScan','Invoke-CauRun') {
+  Assert-Ready ($null -ne (Get-Command $cmd -ErrorAction SilentlyContinue)) "Missing command: $cmd"
+ }
  Test-Preflight $ClusterName
  Write-Host "Preflight passed for $ClusterName ($($nodes.Count) nodes)"
  if(-not $PreCheckOnly) {
@@ -270,27 +314,31 @@ try {
    $approval=Read-Host "Type $ClusterName to approve patching"
    Assert-Ready ($approval -ceq $ClusterName) 'Approval not granted'
   }
+  Write-Phase 'Staging signed MSUs to CAU share'
   Stage-ApprovedPackages -Files $packages -Root $HotfixRoot
   if($ScanOnly) {
+   Write-Phase 'Running CAU scan'
    Invoke-CauScan -ClusterName $ClusterName -CauPluginName Microsoft.HotfixPlugin -CauPluginArguments $pluginArgs | Export-Csv (Join-Path $reportDir 'cau-scan.csv') -NoTypeInformation
   } else {
    $started=$true
    $runParams=@{ClusterName=$ClusterName;CauPluginName='Microsoft.HotfixPlugin';CauPluginArguments=$pluginArgs;MaxRetriesPerNode=1;MaxFailedNodes=0;RequireAllNodesOnline=$true;WarnAfter=(New-TimeSpan -Hours 4);StopAfter=(New-TimeSpan -Hours 8);Force=$true}
+   Write-Phase 'Starting CAU patch run'
    Invoke-CauRun @runParams
   }
  }
 } catch {
- $failure=$_.ToString()
+ $failure="Phase '$phase': $($_.ToString())"
  Write-Warning $failure
  $failure | Set-Content (Join-Path $reportDir 'error.txt')
 } finally {
  if($nodes.Count -gt 0) {
   try {
+   Write-Phase 'Collecting postflight node health'
    $after=@(Get-NodeSnapshot -Names $nodes)
    $after | Export-Csv (Join-Path $reportDir 'nodes-after.csv') -NoTypeInformation
    (Get-ClusterHealth $ClusterName) | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $reportDir 'cluster-after.json')
    if($started -and (@($after | Where-Object Build -ne $ExpectedBuild).Count -gt 0 -or $after.Count -ne $nodes.Count)) {
-    $failure="Target build $ExpectedBuild was not verified on all nodes"
+    if(-not $failure) { $failure="Target build $ExpectedBuild was not verified on all nodes" }
    }
   } catch {
    $_.ToString() | Set-Content (Join-Path $reportDir 'postflight-error.txt')
@@ -299,6 +347,7 @@ try {
  }
  if($started) {
   try {
+   Write-Phase 'Exporting CAU report'
    $cau=Get-CauReport -ClusterName $ClusterName -Last -Detailed
    $cau | Export-CauReport -Format HTML -Path (Join-Path $reportDir 'cau-report.html') -Force
   } catch {
