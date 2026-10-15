@@ -94,6 +94,11 @@
 
 .NOTES
     STATUS: DEVELOPMENT / LAB TEST REQUIRED.
+    CAU readiness rules and scan summary are exported separately. Failed
+    rules are warnings in PreCheckOnly, but block scan and patch modes.
+    Rule 10 (machine proxy) and Rule 11 (CAU clustered role) require
+    operator review; no automatic proxy or clustered-role changes occur.
+    A successful CAU scan does not mean every readiness rule passed.
     PowerShell 7 can import clustering commands via WinPSCompatSession; the
     resulting objects may be deserialized. V2 checks property availability
     explicitly and records the preflight phase for diagnosis.
@@ -128,7 +133,8 @@
     Expected report files (when corresponding stages are reached):
       transcript.log, nodes-before.csv, cluster-before.json, packages.csv,
       cau-scan.csv (scan), nodes-after.csv, cluster-after.json,
-      cau-report.html (patch), error.txt or *-error.txt (on failures).
+      cau-report.html (patch), cau-readiness-rules.csv,
+      cau-readiness-summary.json, error.txt or *-error.txt (on failures).
 
     Design deliberately retains Microsoft's CAU as the patching engine.
 #>
@@ -251,8 +257,61 @@ function Test-Preflight([string]$Name) {
  Assert-Ready ($script:before.Count -eq $script:nodes.Count) 'Incomplete node inventory'
  Assert-Ready (@($script:before | Where-Object PendingReboot).Count -eq 0) 'Pending reboot detected'
  Write-Phase 'Running Test-CauSetup (may take several minutes)'
- $test=@(Test-CauSetup -ClusterName $Name)
- Assert-Ready (@($test | Where-Object { (Get-PropertyText $_ 'State' 'CAU setup result') -eq 'Failed' }).Count -eq 0) 'CAU setup failed'
+ # Test-CauSetup emits CauBpaProgress entries AND a final ArrayList summary.
+ # Collect progress separately from summary; never assume all output has State.
+ $rawCau=@(Test-CauSetup -ClusterName $Name)
+ $ruleResults=@()
+ $summaries=@()
+ foreach($entry in $rawCau) {
+  if($null -eq $entry) { continue }
+  if($null -ne $entry.PSObject.Properties['RuleId'] -and
+     $null -ne $entry.PSObject.Properties['State']) {
+   $ruleResults+=,$entry
+   continue
+  }
+  if($entry -is [System.Collections.IEnumerable] -and $entry -isnot [string]) {
+   foreach($nested in $entry) {
+    if($null -eq $nested) { continue }
+    if($null -ne $nested.PSObject.Properties['RuleId'] -and
+       $null -ne $nested.PSObject.Properties['State']) {
+     $ruleResults+=,$nested
+    } elseif($null -ne $nested.PSObject.Properties['Success']) {
+     $summaries+=,$nested
+    }
+   }
+  }
+  if($null -ne $entry.PSObject.Properties['Success']) { $summaries+=,$entry }
+ }
+ $latest=@($ruleResults | Group-Object RuleId | ForEach-Object {
+  $_.Group | Select-Object -Last 1
+ })
+ $cauRows=@($latest | ForEach-Object {
+  [pscustomobject]@{
+   RuleId=$_.RuleId; Title=$_.Title; State=[string]$_.State
+   Severity=[string]$_.Severity
+   FailedMachines=([string]::Join(', ',@($_.FailedMachines)))
+  }
+ })
+ $cauRows | Export-Csv (Join-Path $reportDir 'cau-readiness-rules.csv') -NoTypeInformation
+ $failedRules=@($cauRows | Where-Object State -eq 'Failed')
+ foreach($rule in $failedRules) {
+  Write-Warning ("CAU rule {0}: {1}; severity={2}; affected={3}" -f $rule.RuleId,$rule.Title,$rule.Severity,$rule.FailedMachines)
+ }
+ $scanSuccess=@($summaries | Where-Object { $_.Success -eq $true }).Count -gt 0
+ $scanFailed=@($summaries | Where-Object { $_.Success -eq $false }).Count -gt 0
+ [pscustomobject]@{
+  ScanReportedSuccess=$scanSuccess; ScanReportedFailure=$scanFailed
+  RuleCount=$cauRows.Count; FailedRuleCount=$failedRules.Count
+  SummaryCount=$summaries.Count
+ } | ConvertTo-Json | Set-Content (Join-Path $reportDir 'cau-readiness-summary.json')
+ Assert-Ready ($cauRows.Count -gt 0) 'CAU returned no recognizable rule results'
+ Assert-Ready (-not $scanFailed) 'CAU setup summary reported failure'
+ # Precheck reports findings but does not approve patching. Fail closed on any
+ # failed rule in scan/patch mode until the environment has been reviewed.
+ if(-not $PreCheckOnly) {
+  Assert-Ready ($scanSuccess) 'CAU setup did not report successful completion'
+  Assert-Ready ($failedRules.Count -eq 0) 'CAU readiness rules failed. Review cau-readiness-rules.csv before staging or patching.'
+ }
  Write-Phase 'Estimating N-1 evacuation capacity'
  Test-Evacuation -Names $script:nodes -Snapshot $script:before
  $health | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $reportDir 'cluster-before.json')
