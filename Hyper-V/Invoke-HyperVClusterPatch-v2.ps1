@@ -1,11 +1,125 @@
 <#
 .SYNOPSIS
-  Development v2 for manually initiated Windows Server 2025 Hyper-V CSV cluster CAU.
+    Manually initiated Windows Server 2025 Hyper-V cluster patching using
+    Cluster-Aware Updating (CAU), Microsoft.HotfixPlugin, and staged MSU files.
+
+.DESCRIPTION
+    Development version 2 for Hyper-V failover clusters using Cluster Shared
+    Volumes (CSV). Designed for 3-, 6-, 8-, and 13-node clusters.
+
+    Workflow:
+      1. Load FailoverClusters, ClusterAwareUpdating, and Hyper-V modules.
+      2. Discover cluster nodes, CSVs, VM roles, and failed resources.
+      3. Collect OS build, last boot, free memory, and reboot-pending state.
+      4. Run Test-CauSetup and estimate each node's evacuation capacity.
+      5. In patch/scan modes, validate local MSU signatures and package count.
+      6. In patch mode, require the operator to type the cluster name.
+      7. Copy MSUs to temporary CAU staging, compare SHA256 hashes, and
+         rename the completed folder to CAUHotfix_All.
+      8. In scan mode, invoke Invoke-CauScan without installing updates.
+      9. In patch mode, invoke CAU for sequential node servicing.
+     10. Attempt post-run node/cluster snapshots and a CAU HTML report.
+
+    CAU is responsible for drain, live migration, patch installation, reboot,
+    and node resumption. This script does not implement those actions itself.
+
+    IMPORTANT:
+    This is a development prototype, NOT a production-validated solution.
+    Its evacuation estimate is not a guarantee of migration feasibility.
+    Application-level health, CSV redirected I/O, quorum, checkpoint update
+    prerequisites, and recovery handling need further implementation/testing.
+
+.PARAMETER ClusterName
+    Target failover cluster. Only one cluster is processed per invocation.
+
+.PARAMETER SourceFolder
+    Local or accessible folder containing approved .msu packages.
+    Required for ScanOnly and patch modes; omitted for PreCheckOnly.
+
+.PARAMETER HotfixRoot
+    UNC root for Microsoft.HotfixPlugin, containing DefaultHotfixConfig.xml.
+    Must be accessible to CAU and cluster nodes, with appropriate permissions.
+    The script refuses to overwrite an existing CAUHotfix_All folder.
+
+.PARAMETER PreCheckOnly
+    Run cluster readiness checks without staging packages or invoking CAU.
+    Report files and a transcript are still written locally.
+
+.PARAMETER ScanOnly
+    Run preflight, validate/stage MSUs, and invoke CAU scan only.
+    Does NOT install patches or reboot nodes, but DOES modify the CAU share.
+
+.PARAMETER ExpectedBuild
+    Required target OS build string in patch mode (for example, 26100.XXXX).
+    Compared against node builds after CAU. This does not independently
+    prove KB installation or that application services are healthy.
+
+.PARAMETER ReportFolder
+    Parent folder for per-run timestamped reports. Defaults to PatchReports
+    alongside this script.
+
+.PARAMETER MemoryReservePercent
+    Percentage of each destination node's currently free memory excluded
+    from the evacuation estimate. Default: 20; accepted range: 5-50.
+    The simulation is an approximation and does not account for every
+    placement, CPU, affinity, or migration-network constraint.
+
+.PARAMETER InstallerTimeoutMinutes
+    HotfixPlugin installer timeout per node, default 120 minutes.
+    Validate plugin support and behavior in your Server 2025 environment.
+
+.PARAMETER RequireSmbEncryption
+    Passes the SMB encryption requirement to the HotfixPlugin. Default true.
+    The share must be configured to support the chosen setting.
+
+.EXAMPLE
+    # Health checks only; no patch share changes
+    .\Invoke-HyperVClusterPatch-v2.ps1 -ClusterName HVCLUS01 -PreCheckOnly
+
+.EXAMPLE
+    # Validate and stage approved MSUs, then run CAU scan only
+    .\Invoke-HyperVClusterPatch-v2.ps1 -ClusterName HVCLUS01 -SourceFolder D:\Patches\2026-10 -HotfixRoot \\FS01\CAU\HVCLUS01 -ScanOnly
+
+.EXAMPLE
+    # Manually authorize patching with a typed cluster-name confirmation
+    .\Invoke-HyperVClusterPatch-v2.ps1 -ClusterName HVCLUS01 -SourceFolder D:\Patches\2026-10 -HotfixRoot \\FS01\CAU\HVCLUS01 -ExpectedBuild 26100.XXXX
+
 .NOTES
-  LAB TEST REQUIRED. Supports preflight, staging, scan and manual CAU execution.
-  Deliberately rejects checkpoint chains and refuses to replace active staging.
-  Does not guarantee migration placement or application-level health.
+    STATUS: DEVELOPMENT / LAB TEST REQUIRED.
+
+    Prerequisites:
+      - Windows PowerShell with FailoverClusters, ClusterAwareUpdating,
+        and Hyper-V modules available on the management host.
+      - Domain identity with appropriate cluster/node administration rights.
+      - WinRM/PowerShell remoting to every cluster node.
+      - CAU HotfixPlugin share, permissions, and DefaultHotfixConfig.xml
+        configured in advance.
+      - Approved and independently verified Server 2025 update packages.
+      - Working live migration and sufficient cluster/CSV health.
+
+    SAFETY / LIMITATIONS:
+      - PreCheckOnly creates local reports but makes no intended cluster changes.
+      - ScanOnly DOES stage files in the CAU share.
+      - Existing CAUHotfix_All causes a hard stop; archive it manually.
+      - Multiple OS CU files/checkpoint chains are rejected, not sequenced.
+      - A Microsoft signature alone does not establish that an MSU is the
+        correct approved update for the cluster.
+      - Pending reboot detection checks two registry locations only.
+      - No unattended scheduling, multi-cluster orchestration, automatic
+        forced reboot, or automatic rollback is provided.
+      - Report collection is best effort, including on failures.
+      - CAU command compatibility and post-run success criteria require
+        lab verification before any production use.
+      - Avoid overlapping patch operations against the same CAU share.
+
+    Expected report files (when corresponding stages are reached):
+      transcript.log, nodes-before.csv, cluster-before.json, packages.csv,
+      cau-scan.csv (scan), nodes-after.csv, cluster-after.json,
+      cau-report.html (patch), error.txt or *-error.txt (on failures).
+
+    Design deliberately retains Microsoft's CAU as the patching engine.
 #>
+
 [CmdletBinding(DefaultParameterSetName='Patch')]
 param(
  [Parameter(Mandatory)][string]$ClusterName,
