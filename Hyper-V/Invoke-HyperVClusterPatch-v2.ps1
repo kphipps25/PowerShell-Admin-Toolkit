@@ -8,6 +8,7 @@
     Volumes (CSV). Designed for 3-, 6-, 8-, and 13-node clusters.
 
     Workflow:
+      - ValidateFilesOnly independently checks local MSUs, without CAU.
       1. Load FailoverClusters, ClusterAwareUpdating, and Hyper-V modules.
       2. Discover cluster nodes, CSVs, VM roles, and failed resources.
       3. Collect OS build, last boot, free memory, and reboot-pending state.
@@ -34,7 +35,7 @@
 
 .PARAMETER SourceFolder
     Local or accessible folder containing approved .msu packages.
-    Required for ScanOnly and patch modes; omitted for PreCheckOnly.
+    Required for ValidateFilesOnly, ScanOnly and patch modes; omitted for PreCheckOnly.
 
 .PARAMETER HotfixRoot
     UNC root for Microsoft.HotfixPlugin, containing DefaultHotfixConfig.xml.
@@ -44,6 +45,15 @@
 .PARAMETER PreCheckOnly
     Run cluster readiness checks without staging packages or invoking CAU.
     Report files and a transcript are still written locally.
+
+.PARAMETER ValidateFilesOnly
+    Validate locally downloaded MSU files without loading cluster modules,
+    contacting nodes, running CAU, or writing to the CAU staging share.
+    Requires SourceFolder; ClusterName and HotfixRoot are not needed.
+    Creates a packages.csv inventory with file size, signature status,
+    Microsoft signer, and SHA256 hash. Enforces the existing conservative
+    single-OS-package check; this does NOT verify KB applicability or
+    checkpoint update prerequisites. The operator must review those.
 
 .PARAMETER ScanOnly
     Run preflight, validate/stage MSUs, and invoke CAU scan only.
@@ -94,6 +104,10 @@
     .\Invoke-HyperVClusterPatch-v2.ps1 -ClusterName HVCLUS01 -PreCheckOnly
 
 .EXAMPLE
+    # Validate downloaded MSUs only; no cluster or CAU share access
+    .\Invoke-HyperVClusterPatch-v2.ps1 -SourceFolder D:\Patches\2026-10 -ValidateFilesOnly
+
+.EXAMPLE
     # Validate and stage approved MSUs, then run CAU scan only
     .\Invoke-HyperVClusterPatch-v2.ps1 -ClusterName HVCLUS01 -SourceFolder D:\Patches\2026-10 -HotfixRoot \\FS01\CAU\HVCLUS01 -ScanOnly
 
@@ -131,6 +145,7 @@
 
     SAFETY / LIMITATIONS:
       - PreCheckOnly creates local reports but makes no intended cluster changes.
+      - ValidateFilesOnly reads local MSUs and writes local reports only.
       - ScanOnly DOES stage files in the CAU share.
       - Existing CAUHotfix_All causes a hard stop; archive it manually.
       - Multiple OS CU files/checkpoint chains are rejected, not sequenced.
@@ -157,13 +172,17 @@
 
 [CmdletBinding(DefaultParameterSetName='Patch')]
 param(
- [Parameter(Mandatory)][string]$ClusterName,
  [Parameter(Mandatory,ParameterSetName='Patch')]
- [Parameter(Mandatory,ParameterSetName='Scan')][string]$SourceFolder,
+ [Parameter(Mandatory,ParameterSetName='Scan')]
+ [Parameter(Mandatory,ParameterSetName='Preflight')][string]$ClusterName,
+ [Parameter(Mandatory,ParameterSetName='Patch')]
+ [Parameter(Mandatory,ParameterSetName='Scan')]
+ [Parameter(Mandatory,ParameterSetName='Files')][string]$SourceFolder,
  [Parameter(Mandatory,ParameterSetName='Patch')]
  [Parameter(Mandatory,ParameterSetName='Scan')]
  [ValidatePattern('^\\\\')][string]$HotfixRoot,
  [Parameter(Mandatory,ParameterSetName='Preflight')][switch]$PreCheckOnly,
+ [Parameter(Mandatory,ParameterSetName='Files')][switch]$ValidateFilesOnly,
  [Parameter(Mandatory,ParameterSetName='Scan')][switch]$ScanOnly,
  [Parameter(Mandatory,ParameterSetName='Patch')][string]$ExpectedBuild,
  [string]$ReportFolder=(Join-Path $PSScriptRoot 'PatchReports'),
@@ -177,7 +196,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
-$reportDir=Join-Path $ReportFolder "$ClusterName-$stamp"
+$reportLabel=if($ValidateFilesOnly) { 'LocalMSUValidation' } else { $ClusterName }
+$reportDir=Join-Path $ReportFolder "$reportLabel-$stamp"
 New-Item -Path $reportDir -ItemType Directory -Force | Out-Null
 $transcribing=$false
 $nodes=@()
@@ -380,6 +400,22 @@ function Stage-ApprovedPackages([object[]]$Files,[string]$Root) {
 try {
  Start-Transcript -Path (Join-Path $reportDir 'transcript.log') | Out-Null
  $transcribing=$true
+ if($ValidateFilesOnly) {
+  Write-Phase 'Validating local MSU files only (no cluster or CAU access)'
+  $packages=@(Get-ApprovedPackages $SourceFolder)
+  $rows=@(foreach($package in $packages) {
+   $signature=Get-AuthenticodeSignature -LiteralPath $package.FullName
+   [pscustomobject]@{
+    Name=$package.Name
+    SizeMB=[math]::Round($package.Length / 1MB,2)
+    SignatureStatus=[string]$signature.Status
+    Signer=[string]$signature.SignerCertificate.Subject
+    SHA256=(Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash
+   }
+  })
+  $rows | Export-Csv (Join-Path $reportDir 'packages.csv') -NoTypeInformation
+  Write-Host "Validated $($rows.Count) MSU file(s); report: $reportDir"
+ } else {
  Write-Phase "PowerShell $($PSVersionTable.PSVersion); importing required modules"
  foreach($module in 'FailoverClusters','ClusterAwareUpdating','Hyper-V') {
   Write-Phase "Importing $module"
@@ -411,6 +447,7 @@ try {
    Write-Phase 'Starting CAU patch run'
    Invoke-CauRun @runParams
   }
+ }
  }
 } catch {
  $failure="Phase '$phase': $($_.ToString())"
