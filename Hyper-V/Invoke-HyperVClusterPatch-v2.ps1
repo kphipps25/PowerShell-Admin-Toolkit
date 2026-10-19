@@ -9,6 +9,7 @@
 
     Workflow:
       - ValidateFilesOnly independently checks local MSUs, without CAU.
+      - ValidateStagingOnly checks the share and node read access, without CAU.
       1. Load FailoverClusters, ClusterAwareUpdating, and Hyper-V modules.
       2. Discover cluster nodes, CSVs, VM roles, and failed resources.
       3. Collect OS build, last boot, free memory, and reboot-pending state.
@@ -54,6 +55,16 @@
     Microsoft signer, and SHA256 hash. Enforces the existing conservative
     single-OS-package check; this does NOT verify KB applicability or
     checkpoint update prerequisites. The operator must review those.
+
+.PARAMETER ValidateStagingOnly
+    Read-only validation of the CAU UNC staging root and per-node access.
+    Requires ClusterName and HotfixRoot, but not SourceFolder.
+    Checks that the share and DefaultHotfixConfig.xml are accessible
+    from the management host and every cluster node using WinRM.
+    Fails if CAUHotfix_All already exists. Does not test write permissions,
+    SMB encryption enforcement, CAU plugin behavior, or update applicability.
+    No files are copied to the CAU share and CAU is not invoked.
+    Creates staging-validation.csv in the local report directory.
 
 .PARAMETER ScanOnly
     Run preflight, validate/stage MSUs, and invoke CAU scan only.
@@ -108,6 +119,10 @@
     .\Invoke-HyperVClusterPatch-v2.ps1 -SourceFolder D:\Patches\2026-10 -ValidateFilesOnly
 
 .EXAMPLE
+    # Read-only check of the CAU staging share from all cluster nodes
+    .\Invoke-HyperVClusterPatch-v2.ps1 -ClusterName HVCLUS01 -HotfixRoot \\FS01\CAU\HVCLUS01 -ValidateStagingOnly
+
+.EXAMPLE
     # Validate and stage approved MSUs, then run CAU scan only
     .\Invoke-HyperVClusterPatch-v2.ps1 -ClusterName HVCLUS01 -SourceFolder D:\Patches\2026-10 -HotfixRoot \\FS01\CAU\HVCLUS01 -ScanOnly
 
@@ -146,6 +161,8 @@
     SAFETY / LIMITATIONS:
       - PreCheckOnly creates local reports but makes no intended cluster changes.
       - ValidateFilesOnly reads local MSUs and writes local reports only.
+      - ValidateStagingOnly reads the share and uses WinRM, but makes no
+        intended changes to the CAU share or cluster.
       - ScanOnly DOES stage files in the CAU share.
       - Existing CAUHotfix_All causes a hard stop; archive it manually.
       - Multiple OS CU files/checkpoint chains are rejected, not sequenced.
@@ -165,6 +182,7 @@
 
     Expected report files (when corresponding stages are reached):
       transcript.log, nodes-before.csv, cluster-before.json, packages.csv,
+      staging-validation.csv (staging check),
       cau-scan.csv (scan), nodes-after.csv, cluster-after.json,
       cau-report.html (patch), cau-readiness-rules.csv,
       cau-readiness-summary.json, error.txt or *-error.txt (on failures).
@@ -176,15 +194,18 @@
 param(
  [Parameter(Mandatory,ParameterSetName='Patch')]
  [Parameter(Mandatory,ParameterSetName='Scan')]
- [Parameter(Mandatory,ParameterSetName='Preflight')][string]$ClusterName,
+ [Parameter(Mandatory,ParameterSetName='Preflight')]
+ [Parameter(Mandatory,ParameterSetName='Staging')][string]$ClusterName,
  [Parameter(Mandatory,ParameterSetName='Patch')]
  [Parameter(Mandatory,ParameterSetName='Scan')]
  [Parameter(Mandatory,ParameterSetName='Files')][string]$SourceFolder,
  [Parameter(Mandatory,ParameterSetName='Patch')]
  [Parameter(Mandatory,ParameterSetName='Scan')]
+ [Parameter(Mandatory,ParameterSetName='Staging')]
  [ValidatePattern('^\\\\')][string]$HotfixRoot,
  [Parameter(Mandatory,ParameterSetName='Preflight')][switch]$PreCheckOnly,
  [Parameter(Mandatory,ParameterSetName='Files')][switch]$ValidateFilesOnly,
+ [Parameter(Mandatory,ParameterSetName='Staging')][switch]$ValidateStagingOnly,
  [Parameter(Mandatory,ParameterSetName='Scan')][switch]$ScanOnly,
  [Parameter(Mandatory,ParameterSetName='Patch')][string]$ExpectedBuild,
  [string]$ReportFolder=(Join-Path $PSScriptRoot 'PatchReports'),
@@ -198,7 +219,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
-$reportLabel=if($ValidateFilesOnly) { 'LocalMSUValidation' } else { $ClusterName }
+$reportLabel=if($ValidateFilesOnly) { 'LocalMSUValidation' } elseif($ValidateStagingOnly) { "$ClusterName-StagingValidation" } else { $ClusterName }
 $reportDir=Join-Path $ReportFolder "$reportLabel-$stamp"
 New-Item -Path $reportDir -ItemType Directory -Force | Out-Null
 $transcribing=$false
@@ -398,6 +419,47 @@ function Get-ApprovedPackages([string]$Folder) {
  }
  return @($files)
 }
+function Test-StagingReadiness([string]$Name,[string]$Root) {
+ Write-Phase 'Checking CAU share from management host (read-only)'
+ $results=@()
+ $rootOk=Test-Path -LiteralPath $Root -PathType Container
+ $configOk=$false
+ $activeExists=$false
+ if($rootOk) {
+  $configOk=Test-Path -LiteralPath (Join-Path $Root 'DefaultHotfixConfig.xml') -PathType Leaf
+  $activeExists=Test-Path -LiteralPath (Join-Path $Root 'CAUHotfix_All')
+ }
+ $results+= [pscustomobject]@{Computer=$env:COMPUTERNAME;RootAccessible=$rootOk;ConfigAccessible=$configOk;ActiveFolderExists=$activeExists;Error=''}
+ Write-Phase 'Discovering cluster nodes for staging access'
+ $clusterNodes=@(Get-ClusterNode -Cluster $Name)
+ Assert-Ready ($clusterNodes.Count -gt 0) 'No cluster nodes returned'
+ foreach($node in $clusterNodes) {
+  $nodeName=[string]$node.Name
+  Write-Phase "Checking read access from $nodeName"
+  try {
+   $sessionOption=New-PSSessionOption -OpenTimeout ($WinRMConnectTimeoutSeconds*1000) -OperationTimeout ($WinRMOperationTimeoutSeconds*1000)
+   $result=Invoke-Command -ComputerName $nodeName -SessionOption $sessionOption -ArgumentList $Root -ErrorAction Stop -ScriptBlock {
+    param([string]$ShareRoot)
+    $available=Test-Path -LiteralPath $ShareRoot -PathType Container
+    [pscustomobject]@{
+     Computer=$env:COMPUTERNAME
+     RootAccessible=$available
+     ConfigAccessible=($available -and (Test-Path -LiteralPath (Join-Path $ShareRoot 'DefaultHotfixConfig.xml') -PathType Leaf))
+     ActiveFolderExists=($available -and (Test-Path -LiteralPath (Join-Path $ShareRoot 'CAUHotfix_All')))
+     Error=''
+    }
+   }
+   Assert-Ready ($null -ne $result) "No response from $nodeName"
+   $results+= $result | Select-Object Computer,RootAccessible,ConfigAccessible,ActiveFolderExists,Error
+  } catch {
+   $results+= [pscustomobject]@{Computer=$nodeName;RootAccessible=$false;ConfigAccessible=$false;ActiveFolderExists=$false;Error=[string]$_}
+  }
+ }
+ $results | Export-Csv (Join-Path $reportDir 'staging-validation.csv') -NoTypeInformation
+ $results | Format-Table -AutoSize | Out-Host
+ Assert-Ready (@($results | Where-Object { -not $_.RootAccessible -or -not $_.ConfigAccessible -or $_.ActiveFolderExists -or $_.Error }).Count -eq 0) 'Staging read-only checks failed. Review staging-validation.csv'
+ Write-Warning 'Read access passed. Write permissions, SMB encryption, and CAU plugin behavior are NOT verified.'
+}
 function Stage-ApprovedPackages([object[]]$Files,[string]$Root) {
  Assert-Ready (Test-Path -LiteralPath $Root -PathType Container) 'CAU hotfix root missing'
  Assert-Ready (Test-Path -LiteralPath (Join-Path $Root 'DefaultHotfixConfig.xml')) 'CAU config must be preconfigured'
@@ -428,6 +490,10 @@ try {
   $rows=@(Get-PackageInventory -Files $packages)
   $rows | Export-Csv (Join-Path $reportDir 'packages.csv') -NoTypeInformation
   Write-Host "Validated $($rows.Count) MSU file(s); report: $reportDir"
+ } elseif($ValidateStagingOnly) {
+  Write-Phase 'Validating CAU staging share only (read-only)'
+  Import-Module FailoverClusters -ErrorAction Stop
+  Test-StagingReadiness -Name $ClusterName -Root $HotfixRoot
  } else {
  Write-Phase "PowerShell $($PSVersionTable.PSVersion); importing required modules"
  foreach($module in 'FailoverClusters','ClusterAwareUpdating','Hyper-V') {
