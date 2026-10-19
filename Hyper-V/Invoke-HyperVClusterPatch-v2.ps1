@@ -59,12 +59,14 @@
 .PARAMETER ValidateStagingOnly
     Read-only validation of the CAU UNC staging root and per-node access.
     Requires ClusterName and HotfixRoot, but not SourceFolder.
-    Checks that the share and DefaultHotfixConfig.xml are accessible
-    from the management host and every cluster node using WinRM.
+    Checks the share and DefaultHotfixConfig.xml from the management host
+    and attempts per-node read checks over WinRM. Remote authentication
+    failures are Inconclusive (possible second hop), not proven denial.
     Fails if CAUHotfix_All already exists. Does not test write permissions,
     SMB encryption enforcement, CAU plugin behavior, or update applicability.
     No files are copied to the CAU share and CAU is not invoked.
-    Creates staging-validation.csv in the local report directory.
+    Creates staging-validation.csv with Passed, Failed, or Inconclusive
+    statuses. Inconclusive is NOT approval to patch; verify directly.
 
 .PARAMETER ScanOnly
     Run preflight, validate/stage MSUs, and invoke CAU scan only.
@@ -420,16 +422,29 @@ function Get-ApprovedPackages([string]$Folder) {
  return @($files)
 }
 function Test-StagingReadiness([string]$Name,[string]$Root) {
+ # A remoted user's SMB access is not proof of the CAU plugin's execution identity.
+ # In particular, a WinRM second hop can produce Access Denied.
  Write-Phase 'Checking CAU share from management host (read-only)'
  $results=@()
- $rootOk=Test-Path -LiteralPath $Root -PathType Container
- $configOk=$false
- $activeExists=$false
- if($rootOk) {
-  $configOk=Test-Path -LiteralPath (Join-Path $Root 'DefaultHotfixConfig.xml') -PathType Leaf
-  $activeExists=Test-Path -LiteralPath (Join-Path $Root 'CAUHotfix_All')
+ $checks=@(
+  @{ Label='Root'; Path=$Root; Type='Container' },
+  @{ Label='Config'; Path=(Join-Path $Root 'DefaultHotfixConfig.xml'); Type='Leaf' },
+  @{ Label='Active'; Path=(Join-Path $Root 'CAUHotfix_All'); Type='Any' }
+ )
+ $localValues=@{}
+ $localError=''
+ foreach($check in $checks) {
+  try {
+   $localValues[$check.Label]=if($check.Type -eq 'Any') { Test-Path -LiteralPath $check.Path -ErrorAction Stop } else { Test-Path -LiteralPath $check.Path -PathType $check.Type -ErrorAction Stop }
+  } catch { $localError=[string]$_; break }
  }
- $results+= [pscustomobject]@{Computer=$env:COMPUTERNAME;RootAccessible=$rootOk;ConfigAccessible=$configOk;ActiveFolderExists=$activeExists;Error=''}
+ $localStatus=if($localError) { 'Failed' } elseif(-not $localValues.Root -or -not $localValues.Config -or $localValues.Active) { 'Failed' } else { 'Passed' }
+ $results+= [pscustomobject]@{
+  Computer=$env:COMPUTERNAME; Scope='ManagementHost'; Status=$localStatus
+  RootAccessible=[bool]$localValues.Root; ConfigAccessible=[bool]$localValues.Config
+  ActiveFolderExists=[bool]$localValues.Active; Error=$localError
+  Note='Checks current management identity; no writes performed'
+ }
  Write-Phase 'Discovering cluster nodes for staging access'
  $clusterNodes=@(Get-ClusterNode -Cluster $Name)
  Assert-Ready ($clusterNodes.Count -gt 0) 'No cluster nodes returned'
@@ -440,25 +455,54 @@ function Test-StagingReadiness([string]$Name,[string]$Root) {
    $sessionOption=New-PSSessionOption -OpenTimeout ($WinRMConnectTimeoutSeconds*1000) -OperationTimeout ($WinRMOperationTimeoutSeconds*1000)
    $result=Invoke-Command -ComputerName $nodeName -SessionOption $sessionOption -ArgumentList $Root -ErrorAction Stop -ScriptBlock {
     param([string]$ShareRoot)
-    $available=Test-Path -LiteralPath $ShareRoot -PathType Container
+    $rootOk=$false; $configOk=$false; $active=$false; $errorText=''
+    try {
+     $rootOk=Test-Path -LiteralPath $ShareRoot -PathType Container -ErrorAction Stop
+     if($rootOk) {
+      $configOk=Test-Path -LiteralPath (Join-Path $ShareRoot 'DefaultHotfixConfig.xml') -PathType Leaf -ErrorAction Stop
+      $active=Test-Path -LiteralPath (Join-Path $ShareRoot 'CAUHotfix_All') -ErrorAction Stop
+     }
+    } catch { $errorText=[string]$_ }
     [pscustomobject]@{
-     Computer=$env:COMPUTERNAME
-     RootAccessible=$available
-     ConfigAccessible=($available -and (Test-Path -LiteralPath (Join-Path $ShareRoot 'DefaultHotfixConfig.xml') -PathType Leaf))
-     ActiveFolderExists=($available -and (Test-Path -LiteralPath (Join-Path $ShareRoot 'CAUHotfix_All')))
-     Error=''
+     Computer=$env:COMPUTERNAME; RootAccessible=$rootOk
+     ConfigAccessible=$configOk; ActiveFolderExists=$active; Error=$errorText
     }
    }
-   Assert-Ready ($null -ne $result) "No response from $nodeName"
-   $results+= $result | Select-Object Computer,RootAccessible,ConfigAccessible,ActiveFolderExists,Error
+   if($null -eq $result) { throw "No response from $nodeName" }
+   $errorText=[string]$result.Error
+   # A false Test-Path on a remote UNC path may conceal authentication errors.
+   # Do not assert a genuine permission failure or successful access without evidence.
+   $status=if($result.RootAccessible -and $result.ConfigAccessible -and -not $result.ActiveFolderExists -and -not $errorText) {
+    'Passed'
+   } elseif($result.RootAccessible -and $result.ActiveFolderExists) {
+    'Failed'
+   } elseif($result.RootAccessible -and -not $result.ConfigAccessible -and -not $errorText) {
+    'Failed'
+   } else { 'Inconclusive' }
+   $note=if($status -eq 'Inconclusive') { 'Remote UNC access not verified; WinRM second-hop or permissions may be involved. Verify directly on node.' } else { 'Remote read check only; CAU identity not tested' }
+   $results+= [pscustomobject]@{
+    Computer=$nodeName;Scope='RemoteWinRM';Status=$status
+    RootAccessible=[bool]$result.RootAccessible;ConfigAccessible=[bool]$result.ConfigAccessible
+    ActiveFolderExists=[bool]$result.ActiveFolderExists;Error=$errorText;Note=$note
+   }
   } catch {
-   $results+= [pscustomobject]@{Computer=$nodeName;RootAccessible=$false;ConfigAccessible=$false;ActiveFolderExists=$false;Error=[string]$_}
+   $results+= [pscustomobject]@{
+    Computer=$nodeName;Scope='RemoteWinRM';Status='Inconclusive'
+    RootAccessible=$false;ConfigAccessible=$false;ActiveFolderExists=$false
+    Error=[string]$_
+    Note='Remote check failed; may be WinRM authentication or transport. Verify directly on node.'
+   }
   }
  }
  $results | Export-Csv (Join-Path $reportDir 'staging-validation.csv') -NoTypeInformation
- $results | Format-Table -AutoSize | Out-Host
- Assert-Ready (@($results | Where-Object { -not $_.RootAccessible -or -not $_.ConfigAccessible -or $_.ActiveFolderExists -or $_.Error }).Count -eq 0) 'Staging read-only checks failed. Review staging-validation.csv'
- Write-Warning 'Read access passed. Write permissions, SMB encryption, and CAU plugin behavior are NOT verified.'
+ $results | Format-Table Computer,Scope,Status,RootAccessible,ConfigAccessible,ActiveFolderExists -AutoSize | Out-Host
+ $failed=@($results | Where-Object Status -eq 'Failed')
+ $inconclusive=@($results | Where-Object Status -eq 'Inconclusive')
+ if($failed.Count -gt 0) { throw 'Staging checks failed. Review staging-validation.csv' }
+ if($inconclusive.Count -gt 0) {
+  Write-Warning "$($inconclusive.Count) node check(s) inconclusive. Verify share access directly on each node and under the CAU execution identity before patching. Review staging-validation.csv."
+ }
+ Write-Warning 'Read-only checks do NOT verify staging write permissions, SMB encryption, or CAU plugin execution identity.'
 }
 function Stage-ApprovedPackages([object[]]$Files,[string]$Root) {
  Assert-Ready (Test-Path -LiteralPath $Root -PathType Container) 'CAU hotfix root missing'
