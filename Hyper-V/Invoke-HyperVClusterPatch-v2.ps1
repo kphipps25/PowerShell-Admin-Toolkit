@@ -368,7 +368,24 @@ function Test-Preflight([string]$Name) {
 }
 function Get-MsuPackageType([string]$Name) {
  # Filename classification only; it does not establish applicability.
- if($Name -match '(?i)^windows(?:10|11)\.0-kb\d+-[^\\/]*-ndp(?:48|481|[0-9]+)[^\\/]*\.msu
+ if($Name -match '(?i)-ndp(?:48|481)[^\\/]*\.msu$') { return 'DotNetFramework' }
+ if($Name -match '(?i)^windows(?:10|11)\.0-kb\d+-.+\.msu$') { return 'WindowsOS' }
+ return 'Unknown'
+}
+function Get-PackageInventory([object[]]$Files) {
+ @($Files | ForEach-Object {
+  $signature=Get-AuthenticodeSignature -LiteralPath $_.FullName
+  [pscustomobject]@{
+   Name=$_.Name
+   PackageType=(Get-MsuPackageType $_.Name)
+   SizeMB=[math]::Round($_.Length / 1MB,2)
+   SignatureStatus=[string]$signature.Status
+   Signer=[string]$signature.SignerCertificate.Subject
+   SHA256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+  }
+ })
+}
+function Get-ApprovedPackages([string]$Folder) {
  Assert-Ready (Test-Path -LiteralPath $Folder -PathType Container) 'Source folder unavailable'
  $files=@(Get-ChildItem -LiteralPath $Folder -File -Filter '*.msu')
  Assert-Ready ($files.Count -gt 0) 'No MSU packages found'
