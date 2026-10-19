@@ -50,7 +50,7 @@
     Validate locally downloaded MSU files without loading cluster modules,
     contacting nodes, running CAU, or writing to the CAU staging share.
     Requires SourceFolder; ClusterName and HotfixRoot are not needed.
-    Creates a packages.csv inventory with file size, signature status,
+    Creates a packages.csv inventory with PackageType, file size, signature status,
     Microsoft signer, and SHA256 hash. Enforces the existing conservative
     single-OS-package check; this does NOT verify KB applicability or
     checkpoint update prerequisites. The operator must review those.
@@ -149,6 +149,8 @@
       - ScanOnly DOES stage files in the CAU share.
       - Existing CAUHotfix_All causes a hard stop; archive it manually.
       - Multiple OS CU files/checkpoint chains are rejected, not sequenced.
+      - Filename-based classification distinguishes Windows OS and .NET Framework
+        MSUs; it does not validate update applicability or prerequisites.
       - A Microsoft signature alone does not establish that an MSU is the
         correct approved update for the cluster.
       - Pending reboot detection checks two registry locations only.
@@ -363,6 +365,253 @@ function Test-Preflight([string]$Name) {
  Test-Evacuation -Names $script:nodes -Snapshot $script:before
  $health | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $reportDir 'cluster-before.json')
  $script:before | Export-Csv (Join-Path $reportDir 'nodes-before.csv') -NoTypeInformation
+}
+function Get-MsuPackageType([string]$Name) {
+ # Filename classification only; it does not establish applicability.
+ if($Name -match '(?i)^windows(?:10|11)\.0-kb\d+-[^\\/]*-ndp(?:48|481|[0-9]+)[^\\/]*\.msu
+ Assert-Ready (Test-Path -LiteralPath $Folder -PathType Container) 'Source folder unavailable'
+ $files=@(Get-ChildItem -LiteralPath $Folder -File -Filter '*.msu')
+ Assert-Ready ($files.Count -gt 0) 'No MSU packages found'
+ $types=@($files | ForEach-Object { Get-MsuPackageType $_.Name })
+ Assert-Ready (@($types | Where-Object { $_ -eq 'Unknown' }).Count -eq 0) 'Unrecognized MSU filename; review package type before proceeding'
+ Assert-Ready (@($types | Where-Object { $_ -eq 'WindowsOS' }).Count -eq 1) 'Exactly one OS CU required; checkpoint chains must be handled separately'
+ foreach($f in $files) {
+  $sig=Get-AuthenticodeSignature -LiteralPath $f.FullName
+  Assert-Ready ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'O=Microsoft Corporation') "Invalid signature: $($f.Name)"
+ }
+ return @($files)
+}
+function Stage-ApprovedPackages([object[]]$Files,[string]$Root) {
+ Assert-Ready (Test-Path -LiteralPath $Root -PathType Container) 'CAU hotfix root missing'
+ Assert-Ready (Test-Path -LiteralPath (Join-Path $Root 'DefaultHotfixConfig.xml')) 'CAU config must be preconfigured'
+ $active=Join-Path $Root 'CAUHotfix_All'
+ # Fail closed instead of replacing a patch set used by another operation.
+ Assert-Ready (-not (Test-Path -LiteralPath $active)) "Active staging folder exists: $active. Archive it manually after review."
+ $temporary=Join-Path $Root "CAUStaging-$stamp"
+ New-Item -ItemType Directory -Path $temporary | Out-Null
+ try {
+  foreach($f in $Files) {
+   $dest=Join-Path $temporary $f.Name
+   Copy-Item -LiteralPath $f.FullName -Destination $dest
+   $a=(Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
+   $b=(Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
+   Assert-Ready ($a -eq $b) "Hash mismatch: $($f.Name)"
+  }
+  Rename-Item -LiteralPath $temporary -NewName 'CAUHotfix_All'
+ } finally {
+  if(Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
+ }
+}
+try {
+ Start-Transcript -Path (Join-Path $reportDir 'transcript.log') | Out-Null
+ $transcribing=$true
+ if($ValidateFilesOnly) {
+  Write-Phase 'Validating local MSU files only (no cluster or CAU access)'
+  $packages=@(Get-ApprovedPackages $SourceFolder)
+  $rows=@(Get-PackageInventory -Files $packages)
+  $rows | Export-Csv (Join-Path $reportDir 'packages.csv') -NoTypeInformation
+  Write-Host "Validated $($rows.Count) MSU file(s); report: $reportDir"
+ } else {
+ Write-Phase "PowerShell $($PSVersionTable.PSVersion); importing required modules"
+ foreach($module in 'FailoverClusters','ClusterAwareUpdating','Hyper-V') {
+  Write-Phase "Importing $module"
+  Import-Module $module -ErrorAction Stop
+ }
+ Write-Phase 'Validating CAU commands'
+ foreach($cmd in 'Test-CauSetup','Invoke-CauScan','Invoke-CauRun') {
+  Assert-Ready ($null -ne (Get-Command $cmd -ErrorAction SilentlyContinue)) "Missing command: $cmd"
+ }
+ Test-Preflight $ClusterName
+ Write-Host "Preflight passed for $ClusterName ($($nodes.Count) nodes)"
+ if(-not $PreCheckOnly) {
+  $packages=@(Get-ApprovedPackages $SourceFolder)
+  Get-PackageInventory -Files $packages | Export-Csv (Join-Path $reportDir 'packages.csv') -NoTypeInformation
+  $pluginArgs=@{HotfixRootFolderPath=$HotfixRoot;RequireSmbEncryption=$RequireSmbEncryption.ToString();HotfixInstallerTimeoutMinutes=$InstallerTimeoutMinutes.ToString()}
+  if(-not $ScanOnly) {
+   Write-Host "Target cluster $ClusterName; expected build $ExpectedBuild; nodes $($nodes -join ', ')"
+   $approval=Read-Host "Type $ClusterName to approve patching"
+   Assert-Ready ($approval -ceq $ClusterName) 'Approval not granted'
+  }
+  Write-Phase 'Staging signed MSUs to CAU share'
+  Stage-ApprovedPackages -Files $packages -Root $HotfixRoot
+  if($ScanOnly) {
+   Write-Phase 'Running CAU scan'
+   Invoke-CauScan -ClusterName $ClusterName -CauPluginName Microsoft.HotfixPlugin -CauPluginArguments $pluginArgs | Export-Csv (Join-Path $reportDir 'cau-scan.csv') -NoTypeInformation
+  } else {
+   $started=$true
+   $runParams=@{ClusterName=$ClusterName;CauPluginName='Microsoft.HotfixPlugin';CauPluginArguments=$pluginArgs;MaxRetriesPerNode=1;MaxFailedNodes=0;RequireAllNodesOnline=$true;WarnAfter=(New-TimeSpan -Hours 4);StopAfter=(New-TimeSpan -Hours 8);Force=$true}
+   Write-Phase 'Starting CAU patch run'
+   Invoke-CauRun @runParams
+  }
+ }
+ }
+} catch {
+ $failure="Phase '$phase': $($_.ToString())"
+ Write-Warning $failure
+ $failure | Set-Content (Join-Path $reportDir 'error.txt')
+} finally {
+ if($nodes.Count -gt 0) {
+  try {
+   Write-Phase 'Collecting postflight node health'
+   $after=@(Get-NodeSnapshot -Names $nodes)
+   $after | Export-Csv (Join-Path $reportDir 'nodes-after.csv') -NoTypeInformation
+   (Get-ClusterHealth $ClusterName) | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $reportDir 'cluster-after.json')
+   if($started -and (@($after | Where-Object Build -ne $ExpectedBuild).Count -gt 0 -or $after.Count -ne $nodes.Count)) {
+    if(-not $failure) { $failure="Target build $ExpectedBuild was not verified on all nodes" }
+   }
+  } catch {
+   $_.ToString() | Set-Content (Join-Path $reportDir 'postflight-error.txt')
+   if(-not $failure) { $failure=$_.ToString() }
+  }
+ }
+ if($started) {
+  try {
+   Write-Phase 'Exporting CAU report'
+   $cau=Get-CauReport -ClusterName $ClusterName -Last -Detailed
+   $cau | Export-CauReport -Format HTML -Path (Join-Path $reportDir 'cau-report.html') -Force
+  } catch {
+   $_.ToString() | Set-Content (Join-Path $reportDir 'report-error.txt')
+   if(-not $failure) { $failure=$_.ToString() }
+  }
+ }
+ if($transcribing) { Stop-Transcript | Out-Null }
+}
+if($failure) { throw "Review $reportDir : $failure" }
+Write-Host "Workflow finished; reports: $reportDir"
+) { return 'DotNetFramework' }
+ if($Name -match '(?i)^windows(?:10|11)\.0-kb\d+-[^\\/]*\.msu
+ Assert-Ready (Test-Path -LiteralPath $Folder -PathType Container) 'Source folder unavailable'
+ $files=@(Get-ChildItem -LiteralPath $Folder -File -Filter '*.msu')
+ Assert-Ready ($files.Count -gt 0) 'No MSU packages found'
+ $os=@($files | Where-Object Name -match '^windows(10|11)\.0-kb')
+ Assert-Ready ($os.Count -eq 1) 'Exactly one OS CU required; checkpoint chains must be handled separately'
+ foreach($f in $files) {
+  $sig=Get-AuthenticodeSignature -LiteralPath $f.FullName
+  Assert-Ready ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'O=Microsoft Corporation') "Invalid signature: $($f.Name)"
+ }
+ return @($files)
+}
+function Stage-ApprovedPackages([object[]]$Files,[string]$Root) {
+ Assert-Ready (Test-Path -LiteralPath $Root -PathType Container) 'CAU hotfix root missing'
+ Assert-Ready (Test-Path -LiteralPath (Join-Path $Root 'DefaultHotfixConfig.xml')) 'CAU config must be preconfigured'
+ $active=Join-Path $Root 'CAUHotfix_All'
+ # Fail closed instead of replacing a patch set used by another operation.
+ Assert-Ready (-not (Test-Path -LiteralPath $active)) "Active staging folder exists: $active. Archive it manually after review."
+ $temporary=Join-Path $Root "CAUStaging-$stamp"
+ New-Item -ItemType Directory -Path $temporary | Out-Null
+ try {
+  foreach($f in $Files) {
+   $dest=Join-Path $temporary $f.Name
+   Copy-Item -LiteralPath $f.FullName -Destination $dest
+   $a=(Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
+   $b=(Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
+   Assert-Ready ($a -eq $b) "Hash mismatch: $($f.Name)"
+  }
+  Rename-Item -LiteralPath $temporary -NewName 'CAUHotfix_All'
+ } finally {
+  if(Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
+ }
+}
+try {
+ Start-Transcript -Path (Join-Path $reportDir 'transcript.log') | Out-Null
+ $transcribing=$true
+ if($ValidateFilesOnly) {
+  Write-Phase 'Validating local MSU files only (no cluster or CAU access)'
+  $packages=@(Get-ApprovedPackages $SourceFolder)
+  $rows=@(foreach($package in $packages) {
+   $signature=Get-AuthenticodeSignature -LiteralPath $package.FullName
+   [pscustomobject]@{
+    Name=$package.Name
+    SizeMB=[math]::Round($package.Length / 1MB,2)
+    SignatureStatus=[string]$signature.Status
+    Signer=[string]$signature.SignerCertificate.Subject
+    SHA256=(Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash
+   }
+  })
+  $rows | Export-Csv (Join-Path $reportDir 'packages.csv') -NoTypeInformation
+  Write-Host "Validated $($rows.Count) MSU file(s); report: $reportDir"
+ } else {
+ Write-Phase "PowerShell $($PSVersionTable.PSVersion); importing required modules"
+ foreach($module in 'FailoverClusters','ClusterAwareUpdating','Hyper-V') {
+  Write-Phase "Importing $module"
+  Import-Module $module -ErrorAction Stop
+ }
+ Write-Phase 'Validating CAU commands'
+ foreach($cmd in 'Test-CauSetup','Invoke-CauScan','Invoke-CauRun') {
+  Assert-Ready ($null -ne (Get-Command $cmd -ErrorAction SilentlyContinue)) "Missing command: $cmd"
+ }
+ Test-Preflight $ClusterName
+ Write-Host "Preflight passed for $ClusterName ($($nodes.Count) nodes)"
+ if(-not $PreCheckOnly) {
+  $packages=@(Get-ApprovedPackages $SourceFolder)
+  $packages | ForEach-Object { [pscustomobject]@{Name=$_.Name;SHA256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash} } | Export-Csv (Join-Path $reportDir 'packages.csv') -NoTypeInformation
+  $pluginArgs=@{HotfixRootFolderPath=$HotfixRoot;RequireSmbEncryption=$RequireSmbEncryption.ToString();HotfixInstallerTimeoutMinutes=$InstallerTimeoutMinutes.ToString()}
+  if(-not $ScanOnly) {
+   Write-Host "Target cluster $ClusterName; expected build $ExpectedBuild; nodes $($nodes -join ', ')"
+   $approval=Read-Host "Type $ClusterName to approve patching"
+   Assert-Ready ($approval -ceq $ClusterName) 'Approval not granted'
+  }
+  Write-Phase 'Staging signed MSUs to CAU share'
+  Stage-ApprovedPackages -Files $packages -Root $HotfixRoot
+  if($ScanOnly) {
+   Write-Phase 'Running CAU scan'
+   Invoke-CauScan -ClusterName $ClusterName -CauPluginName Microsoft.HotfixPlugin -CauPluginArguments $pluginArgs | Export-Csv (Join-Path $reportDir 'cau-scan.csv') -NoTypeInformation
+  } else {
+   $started=$true
+   $runParams=@{ClusterName=$ClusterName;CauPluginName='Microsoft.HotfixPlugin';CauPluginArguments=$pluginArgs;MaxRetriesPerNode=1;MaxFailedNodes=0;RequireAllNodesOnline=$true;WarnAfter=(New-TimeSpan -Hours 4);StopAfter=(New-TimeSpan -Hours 8);Force=$true}
+   Write-Phase 'Starting CAU patch run'
+   Invoke-CauRun @runParams
+  }
+ }
+ }
+} catch {
+ $failure="Phase '$phase': $($_.ToString())"
+ Write-Warning $failure
+ $failure | Set-Content (Join-Path $reportDir 'error.txt')
+} finally {
+ if($nodes.Count -gt 0) {
+  try {
+   Write-Phase 'Collecting postflight node health'
+   $after=@(Get-NodeSnapshot -Names $nodes)
+   $after | Export-Csv (Join-Path $reportDir 'nodes-after.csv') -NoTypeInformation
+   (Get-ClusterHealth $ClusterName) | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $reportDir 'cluster-after.json')
+   if($started -and (@($after | Where-Object Build -ne $ExpectedBuild).Count -gt 0 -or $after.Count -ne $nodes.Count)) {
+    if(-not $failure) { $failure="Target build $ExpectedBuild was not verified on all nodes" }
+   }
+  } catch {
+   $_.ToString() | Set-Content (Join-Path $reportDir 'postflight-error.txt')
+   if(-not $failure) { $failure=$_.ToString() }
+  }
+ }
+ if($started) {
+  try {
+   Write-Phase 'Exporting CAU report'
+   $cau=Get-CauReport -ClusterName $ClusterName -Last -Detailed
+   $cau | Export-CauReport -Format HTML -Path (Join-Path $reportDir 'cau-report.html') -Force
+  } catch {
+   $_.ToString() | Set-Content (Join-Path $reportDir 'report-error.txt')
+   if(-not $failure) { $failure=$_.ToString() }
+  }
+ }
+ if($transcribing) { Stop-Transcript | Out-Null }
+}
+if($failure) { throw "Review $reportDir : $failure" }
+Write-Host "Workflow finished; reports: $reportDir"
+) { return 'WindowsOS' }
+ return 'Unknown'
+}
+function Get-PackageInventory([object[]]$Files) {
+ @($Files | ForEach-Object {
+  $signature=Get-AuthenticodeSignature -LiteralPath $_.FullName
+  [pscustomobject]@{
+   Name=$_.Name
+   PackageType=(Get-MsuPackageType $_.Name)
+   SizeMB=[math]::Round($_.Length / 1MB,2)
+   SignatureStatus=[string]$signature.Status
+   Signer=[string]$signature.SignerCertificate.Subject
+   SHA256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+  }
+ })
 }
 function Get-ApprovedPackages([string]$Folder) {
  Assert-Ready (Test-Path -LiteralPath $Folder -PathType Container) 'Source folder unavailable'
