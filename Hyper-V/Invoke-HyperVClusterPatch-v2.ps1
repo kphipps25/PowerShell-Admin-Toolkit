@@ -504,6 +504,32 @@ function Test-StagingReadiness([string]$Name,[string]$Root) {
  }
  Write-Warning 'Read-only checks do NOT verify staging write permissions, SMB encryption, or CAU plugin execution identity.'
 }
+function Test-CauSharePermissions([string]$Root) {
+ # This check is deliberately read-only. It requires the share to be hosted locally.
+ $unc=[regex]::Match($Root,'^\\\\([^\\]+)\\([^\\]+)(?:\\|$)')
+ Assert-Ready $unc.Success "Invalid CAU share path: $Root"
+ $server=$unc.Groups[1].Value
+ $shareName=$unc.Groups[2].Value
+ Assert-Ready (($server -split '\\.')[0] -ieq $env:COMPUTERNAME) "Cannot inspect remote share ACLs for $server from this host; refusing to stage."
+ $share=Get-SmbShare -Name $shareName -ErrorAction Stop
+ $shareAcl=@(Get-SmbShareAccess -Name $shareName -ErrorAction Stop)
+ $folderAcl=(Get-Acl -LiteralPath $share.Path -ErrorAction Stop).Access
+ $trusted=@('BUILTIN\\Administrators','NT AUTHORITY\\SYSTEM')
+ $broad=@('Everyone','NT AUTHORITY\\Authenticated Users','BUILTIN\\Users')
+ $unsafeShare=@($shareAcl | Where-Object {
+  $_.AccessControlType -eq 'Allow' -and $_.AccessRight -ne 'Read' -and $_.AccountName -notin $trusted
+ })
+ $unsafeNtfs=@($folderAcl | Where-Object {
+  $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin $trusted -and
+  (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Modify) -eq [System.Security.AccessControl.FileSystemRights]::Modify)
+ })
+ $shareAcl | Select-Object AccountName,AccessControlType,AccessRight |
+  Export-Csv (Join-Path $reportDir 'cau-share-acl.csv') -NoTypeInformation
+ $folderAcl | Select-Object IdentityReference,AccessControlType,FileSystemRights,IsInherited |
+  Export-Csv (Join-Path $reportDir 'cau-ntfs-acl.csv') -NoTypeInformation
+ Assert-Ready ($unsafeShare.Count -eq 0 -and $unsafeNtfs.Count -eq 0) 'CAU share has unexpected write permissions. Review cau-share-acl.csv and cau-ntfs-acl.csv.'
+ Write-Host 'CAU share and NTFS write-permission precheck passed.'
+}
 function Stage-ApprovedPackages([object[]]$Files,[string]$Root) {
  Assert-Ready (Test-Path -LiteralPath $Root -PathType Container) 'CAU hotfix root missing'
  Assert-Ready (Test-Path -LiteralPath (Join-Path $Root 'DefaultHotfixConfig.xml')) 'CAU config must be preconfigured'
@@ -559,6 +585,8 @@ try {
    $approval=Read-Host "Type $ClusterName to approve patching"
    Assert-Ready ($approval -ceq $ClusterName) 'Approval not granted'
   }
+  Write-Phase 'Validating CAU share permissions'
+  Test-CauSharePermissions -Root $HotfixRoot
   Write-Phase 'Staging signed MSUs to CAU share'
   Stage-ApprovedPackages -Files $packages -Root $HotfixRoot
   if($ScanOnly) {
