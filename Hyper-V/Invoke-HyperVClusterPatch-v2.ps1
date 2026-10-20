@@ -518,12 +518,12 @@ function Test-CauSharePermissions([string]$Root) {
  Assert-Ready $unc.Success "Invalid CAU share path: $Root"
  $server=$unc.Groups[1].Value
  $shareName=$unc.Groups[2].Value
- Assert-Ready (($server -split '\\.')[0] -ieq $env:COMPUTERNAME) "Cannot inspect remote share ACLs for $server from this host; refusing to stage."
+ Assert-Ready ($server -ieq $env:COMPUTERNAME) "Cannot inspect remote share ACLs for $server from this host; refusing to stage."
  $share=Get-SmbShare -Name $shareName -ErrorAction Stop
  $shareAcl=@(Get-SmbShareAccess -Name $shareName -ErrorAction Stop)
  $folderAcl=(Get-Acl -LiteralPath $share.Path -ErrorAction Stop).Access
- $trusted=@('BUILTIN\\Administrators','NT AUTHORITY\\SYSTEM')
- $broad=@('Everyone','NT AUTHORITY\\Authenticated Users','BUILTIN\\Users')
+ $trusted=@('BUILTIN\Administrators','NT AUTHORITY\SYSTEM')
+ $broad=@('Everyone','NT AUTHORITY\Authenticated Users','BUILTIN\Users')
  $unsafeShare=@($shareAcl | Where-Object {
   $_.AccessControlType -eq 'Allow' -and $_.AccessRight -ne 'Read' -and $_.AccountName -notin $trusted
  })
