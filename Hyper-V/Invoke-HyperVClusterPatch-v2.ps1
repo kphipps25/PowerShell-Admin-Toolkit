@@ -72,6 +72,11 @@
     Run preflight, validate/stage MSUs, and invoke CAU scan only.
     Does NOT install patches or reboot nodes, but DOES modify the CAU share.
 
+.PARAMETER CleanupScanStaging
+    Optional with ScanOnly. Removes only staging created by this scan after
+    successful scan and postflight, and only if package hashes still match.
+    Without this switch the staging folder is preserved.
+
 .PARAMETER ExpectedBuild
     Required target OS build string in patch mode (for example, 26100.XXXX).
     Compared against node builds after CAU. This does not independently
@@ -209,6 +214,7 @@ param(
  [Parameter(Mandatory,ParameterSetName='Files')][switch]$ValidateFilesOnly,
  [Parameter(Mandatory,ParameterSetName='Staging')][switch]$ValidateStagingOnly,
  [Parameter(Mandatory,ParameterSetName='Scan')][switch]$ScanOnly,
+ [Parameter(ParameterSetName='Scan')][switch]$CleanupScanStaging,
  [Parameter(Mandatory,ParameterSetName='Patch')][string]$ExpectedBuild,
  [string]$ReportFolder=(Join-Path $PSScriptRoot 'PatchReports'),
  [ValidateRange(5,50)][int]$MemoryReservePercent=20,
@@ -230,6 +236,8 @@ $before=@()
 $after=@()
 $started=$false
 $failure=$null
+$scanStageOwned=$false
+$scanFinished=$false
 $phase='Initialization'
 
 function Write-Phase([string]$Message) {
@@ -547,6 +555,7 @@ function Stage-ApprovedPackages([object[]]$Files,[string]$Root) {
    Assert-Ready ($a -eq $b) "Hash mismatch: $($f.Name)"
   }
   Rename-Item -LiteralPath $temporary -NewName 'CAUHotfix_All'
+  if($ScanOnly) { $script:scanStageOwned=$true }
  } finally {
   if(Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
  }
@@ -619,6 +628,7 @@ try {
    $columns = @('ObjectType') + @($scanRows | ForEach-Object { $_.PSObject.Properties.Name } | Where-Object { $_ -ne 'ObjectType' } | Select-Object -Unique)
    $scanRows | Select-Object -Property $columns | Export-Csv (Join-Path $reportDir 'cau-scan.csv') -NoTypeInformation
    Write-Host "CAU scan returned $($scanResults.Count) object(s); exported $($scanRows.Count) rows. Review cau-scan.csv before patching."
+   $scanFinished=$true
   } else {
    $started=$true
    $runParams=@{ClusterName=$ClusterName;CauPluginName='Microsoft.HotfixPlugin';CauPluginArguments=$pluginArgs;MaxRetriesPerNode=1;MaxFailedNodes=0;RequireAllNodesOnline=$true;WarnAfter=(New-TimeSpan -Hours 4);StopAfter=(New-TimeSpan -Hours 8);Force=$true}
@@ -654,6 +664,30 @@ try {
   } catch {
    $_.ToString() | Set-Content (Join-Path $reportDir 'report-error.txt')
    if(-not $failure) { $failure=$_.ToString() }
+  }
+ }
+ if($ScanOnly -and $CleanupScanStaging -and $scanStageOwned) {
+  $active=Join-Path $HotfixRoot 'CAUHotfix_All'
+  if(-not $scanFinished -or $failure) {
+   Write-Warning "Scan not fully successful; preserving staging: $active"
+  } else {
+   try {
+    $staged=@(Get-ChildItem -LiteralPath $active -Force -ErrorAction Stop)
+    Assert-Ready ($staged.Count -eq $packages.Count) 'Staging contents changed; cleanup refused.'
+    foreach($pkg in $packages) {
+     $dest=Join-Path $active $pkg.Name
+     Assert-Ready (Test-Path -LiteralPath $dest -PathType Leaf) "Staging file missing: $($pkg.Name)"
+     Assert-Ready ((Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $pkg.FullName -Algorithm SHA256).Hash) "Staging hash changed: $($pkg.Name)"
+    }
+    Write-Phase 'Cleaning verified scan-only staging'
+    Remove-Item -LiteralPath $active -Recurse -Force -ErrorAction Stop
+    Write-Host "Removed scan-only staging: $active"
+   } catch {
+    $cleanupError="Scan staging cleanup not completed: $_"
+    Write-Warning $cleanupError
+    $cleanupError | Set-Content (Join-Path $reportDir 'cleanup-error.txt')
+    if(-not $failure) { $failure=$cleanupError }
+   }
   }
  }
  if($transcribing) { Stop-Transcript | Out-Null }
