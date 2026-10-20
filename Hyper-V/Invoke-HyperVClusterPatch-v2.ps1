@@ -563,7 +563,34 @@ try {
   Stage-ApprovedPackages -Files $packages -Root $HotfixRoot
   if($ScanOnly) {
    Write-Phase 'Running CAU scan'
-   Invoke-CauScan -ClusterName $ClusterName -CauPluginName Microsoft.HotfixPlugin -CauPluginArguments $pluginArgs | Export-Csv (Join-Path $reportDir 'cau-scan.csv') -NoTypeInformation
+   # Preserve original CAU objects before flattening them for CSV.
+   $scanResults = @(Invoke-CauScan -ClusterName $ClusterName -CauPluginName Microsoft.HotfixPlugin -CauPluginArguments $pluginArgs -ErrorAction Stop)
+   $scanResults | Export-Clixml (Join-Path $reportDir 'cau-scan-raw.clixml')
+   $metadataNames = @('PSComputerName','RunspaceId','PSShowComputerName')
+   $scanRows = @(
+    foreach($item in $scanResults) {
+     if($null -eq $item) { continue }
+     $fields = [ordered]@{ ObjectType = [string]($item.PSObject.TypeNames | Select-Object -First 1) }
+     foreach($property in $item.PSObject.Properties) {
+      if($property.Name -in $metadataNames) { continue }
+      if($property.MemberType -notin @('NoteProperty','Property','AliasProperty','ScriptProperty')) { continue }
+      try {
+       $value = $property.Value
+       if($null -eq $value) { $fields[$property.Name] = '' }
+       elseif($value -is [string] -or $value -is [ValueType]) { $fields[$property.Name] = [string]$value }
+       else { $fields[$property.Name] = ($value | ConvertTo-Json -Depth 8 -Compress) }
+      } catch { $fields[$property.Name] = "[Property read failed: $($_.Exception.Message)]" }
+     }
+     if($fields.Count -gt 1) { [pscustomobject]$fields }
+    }
+   )
+   if($scanRows.Count -eq 0) {
+    throw 'CAU scan returned no usable fields (only remoting metadata or empty output). Raw results saved as cau-scan-raw.clixml; scan NOT verified.'
+   }
+   # Different CAU result types can expose different property sets.
+   $columns = @('ObjectType') + @($scanRows | ForEach-Object { $_.PSObject.Properties.Name } | Where-Object { $_ -ne 'ObjectType' } | Select-Object -Unique)
+   $scanRows | Select-Object -Property $columns | Export-Csv (Join-Path $reportDir 'cau-scan.csv') -NoTypeInformation
+   Write-Host "CAU scan returned $($scanResults.Count) object(s); exported $($scanRows.Count) rows. Review cau-scan.csv before patching."
   } else {
    $started=$true
    $runParams=@{ClusterName=$ClusterName;CauPluginName='Microsoft.HotfixPlugin';CauPluginArguments=$pluginArgs;MaxRetriesPerNode=1;MaxFailedNodes=0;RequireAllNodesOnline=$true;WarnAfter=(New-TimeSpan -Hours 4);StopAfter=(New-TimeSpan -Hours 8);Force=$true}
