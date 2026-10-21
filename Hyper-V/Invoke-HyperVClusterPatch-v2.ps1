@@ -222,8 +222,7 @@ param(
  [bool]$RequireSmbEncryption=$true,
  [ValidateRange(5,120)][int]$WinRMConnectTimeoutSeconds=15,
  [ValidateRange(10,300)][int]$WinRMOperationTimeoutSeconds=60,
- [int[]]$AllowedCauWarningRuleIds=@(),
- [string[]]$AllowedCauNtfsWriteAccounts=@()
+ [int[]]$AllowedCauWarningRuleIds=@()
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -524,23 +523,42 @@ function Test-CauSharePermissions([string]$Root) {
  $shareAcl=@(Get-SmbShareAccess -Name $shareName -ErrorAction Stop)
  $folderAcl=(Get-Acl -LiteralPath $share.Path -ErrorAction Stop).Access
  $trusted=@('BUILTIN\Administrators','NT AUTHORITY\SYSTEM')
- $allowedNtfs=@($trusted) + @($AllowedCauNtfsWriteAccounts)
- $broadWriteAccounts=@('Everyone','NT AUTHORITY\Authenticated Users','BUILTIN\Users')
- Assert-Ready (@($AllowedCauNtfsWriteAccounts | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -in $broadWriteAccounts }).Count -eq 0) 'Invalid broad or empty NTFS write exception.'
- $broad=@('Everyone','NT AUTHORITY\Authenticated Users','BUILTIN\Users')
+ $broad=@('Everyone','NT AUTHORITY\Everyone','NT AUTHORITY\Authenticated Users','BUILTIN\Users')
  $unsafeShare=@($shareAcl | Where-Object {
   $_.AccessControlType -eq 'Allow' -and $_.AccessRight -ne 'Read' -and $_.AccountName -notin $trusted
  })
- $unsafeNtfs=@($folderAcl | Where-Object {
-  $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin $allowedNtfs -and
-  (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Modify) -eq [System.Security.AccessControl.FileSystemRights]::Modify)
+ # WriteData, AppendData, WriteAttributes, WriteExtendedAttributes, Delete,
+ # ChangePermissions and TakeOwnership all grant potentially dangerous control.
+ $writeRights=[System.Security.AccessControl.FileSystemRights]::Write -bor
+  [System.Security.AccessControl.FileSystemRights]::Modify -bor
+  [System.Security.AccessControl.FileSystemRights]::Delete -bor
+  [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+  [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+  [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+ $writers=@($folderAcl | Where-Object {
+  $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin $trusted -and
+  (($_.FileSystemRights -band $writeRights) -ne 0)
  })
+ $broadWriters=@($writers | Where-Object { $_.IdentityReference.Value -in $broad -or
+  $_.IdentityReference.Value -match '^S-1-1-0$|^S-1-5-11$|^S-1-5-32-545$' })
+ $namedWriters=@($writers | Where-Object { $_.IdentityReference.Value -notin $broad -and
+  $_.IdentityReference.Value -notmatch '^S-1-1-0$|^S-1-5-11$|^S-1-5-32-545$' })
  $shareAcl | Select-Object AccountName,AccessControlType,AccessRight |
   Export-Csv (Join-Path $reportDir 'cau-share-acl.csv') -NoTypeInformation
  $folderAcl | Select-Object IdentityReference,AccessControlType,FileSystemRights,IsInherited |
   Export-Csv (Join-Path $reportDir 'cau-ntfs-acl.csv') -NoTypeInformation
- Assert-Ready ($unsafeShare.Count -eq 0 -and $unsafeNtfs.Count -eq 0) 'CAU share has unexpected write permissions. Review cau-share-acl.csv and cau-ntfs-acl.csv.'
- Write-Host 'CAU share and NTFS write-permission precheck passed.'
+ Assert-Ready ($unsafeShare.Count -eq 0) 'CAU SMB share has unexpected write permissions. Review cau-share-acl.csv.'
+ Assert-Ready ($broadWriters.Count -eq 0) 'CAU NTFS folder grants write permissions to a broad group. Review cau-ntfs-acl.csv.'
+ if($namedWriters.Count -gt 0) {
+  $names=(@($namedWriters | ForEach-Object { $_.IdentityReference.Value } | Select-Object -Unique) -join ', ')
+  Write-Warning "Additional CAU NTFS write account(s): $names. Verify these accounts are authorized. Review cau-ntfs-acl.csv."
+  if(-not $ScanOnly) {
+   $ack=Read-Host 'Type ACKNOWLEDGE to accept these NTFS permissions and continue'
+   Assert-Ready ($ack -ceq 'ACKNOWLEDGE') 'CAU NTFS permission warning not acknowledged; patching stopped.'
+  }
+ } else {
+  Write-Host 'CAU share and NTFS write-permission precheck passed.'
+ }
 }
 function Stage-ApprovedPackages([object[]]$Files,[string]$Root) {
  Assert-Ready (Test-Path -LiteralPath $Root -PathType Container) 'CAU hotfix root missing'
