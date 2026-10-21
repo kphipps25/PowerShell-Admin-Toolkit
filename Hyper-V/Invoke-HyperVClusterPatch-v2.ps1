@@ -222,7 +222,8 @@ param(
  [bool]$RequireSmbEncryption=$true,
  [ValidateRange(5,120)][int]$WinRMConnectTimeoutSeconds=15,
  [ValidateRange(10,300)][int]$WinRMOperationTimeoutSeconds=60,
- [int[]]$AllowedCauWarningRuleIds=@()
+ [int[]]$AllowedCauWarningRuleIds=@(),
+ [string[]]$AllowedCauNtfsWriteAccounts=@()
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -523,12 +524,15 @@ function Test-CauSharePermissions([string]$Root) {
  $shareAcl=@(Get-SmbShareAccess -Name $shareName -ErrorAction Stop)
  $folderAcl=(Get-Acl -LiteralPath $share.Path -ErrorAction Stop).Access
  $trusted=@('BUILTIN\Administrators','NT AUTHORITY\SYSTEM')
+ $allowedNtfs=@($trusted) + @($AllowedCauNtfsWriteAccounts)
+ $broadWriteAccounts=@('Everyone','NT AUTHORITY\Authenticated Users','BUILTIN\Users')
+ Assert-Ready (@($AllowedCauNtfsWriteAccounts | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -in $broadWriteAccounts }).Count -eq 0) 'Invalid broad or empty NTFS write exception.'
  $broad=@('Everyone','NT AUTHORITY\Authenticated Users','BUILTIN\Users')
  $unsafeShare=@($shareAcl | Where-Object {
   $_.AccessControlType -eq 'Allow' -and $_.AccessRight -ne 'Read' -and $_.AccountName -notin $trusted
  })
  $unsafeNtfs=@($folderAcl | Where-Object {
-  $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin $trusted -and
+  $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin $allowedNtfs -and
   (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Modify) -eq [System.Security.AccessControl.FileSystemRights]::Modify)
  })
  $shareAcl | Select-Object AccountName,AccessControlType,AccessRight |
