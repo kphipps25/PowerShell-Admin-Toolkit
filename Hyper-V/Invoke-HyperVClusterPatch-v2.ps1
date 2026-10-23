@@ -548,6 +548,26 @@ function Test-CauSharePermissions([string]$Root) {
  $folderAcl | Select-Object IdentityReference,AccessControlType,FileSystemRights,IsInherited |
   Export-Csv (Join-Path $reportDir 'cau-ntfs-acl.csv') -NoTypeInformation
  Assert-Ready ($unsafeShare.Count -eq 0) 'CAU SMB share has unexpected write permissions. Review cau-share-acl.csv.'
+ # The hotfix share needs Read on BOTH SMB and NTFS; a share-only Read ACE is not enough.
+ $authSid='S-1-5-11'
+ $authNames=@('NT AUTHORITY\Authenticated Users',$authSid)
+ $authShareRead=@($shareAcl | Where-Object {
+  $_.AccountName -in $authNames -and $_.AccessControlType -eq 'Allow' -and
+  $_.AccessRight -in @('Read','Change','Full')
+ })
+ $authNtfsRead=@($folderAcl | Where-Object {
+  $_.IdentityReference.Value -in $authNames -and $_.AccessControlType -eq 'Allow' -and
+  (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq
+   [System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
+ })
+ $authDeny=@($shareAcl | Where-Object {
+  $_.AccountName -in $authNames -and $_.AccessControlType -eq 'Deny'
+ })
+ $authDeny+=@($folderAcl | Where-Object {
+  $_.IdentityReference.Value -in $authNames -and $_.AccessControlType -eq 'Deny'
+ })
+ Assert-Ready ($authShareRead.Count -gt 0 -and $authDeny.Count -eq 0) 'CAU SMB share must allow Authenticated Users Read without an explicit Deny. Review cau-share-acl.csv.'
+ Assert-Ready ($authNtfsRead.Count -gt 0) 'CAU NTFS root must allow Authenticated Users ReadAndExecute. Review cau-ntfs-acl.csv.'
  Assert-Ready ($broadWriters.Count -eq 0) 'CAU NTFS folder grants write permissions to a broad group. Review cau-ntfs-acl.csv.'
  if($namedWriters.Count -gt 0) {
   $names=(@($namedWriters | ForEach-Object { $_.IdentityReference.Value } | Select-Object -Unique) -join ', ')
