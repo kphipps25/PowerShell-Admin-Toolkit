@@ -529,12 +529,15 @@ function Test-CauSharePermissions([string]$Root) {
  })
  # WriteData, AppendData, WriteAttributes, WriteExtendedAttributes, Delete,
  # ChangePermissions and TakeOwnership all grant potentially dangerous control.
- $writeRights=[System.Security.AccessControl.FileSystemRights]::Write -bor
-  [System.Security.AccessControl.FileSystemRights]::Modify -bor
-  [System.Security.AccessControl.FileSystemRights]::Delete -bor
-  [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
-  [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
-  [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+  # Composite Modify includes read bits. Check individual write-capable flags only.
+  $writeRights=[System.Security.AccessControl.FileSystemRights]::WriteData -bor
+   [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+   [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+   [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+   [System.Security.AccessControl.FileSystemRights]::Delete -bor
+   [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+   [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+   [System.Security.AccessControl.FileSystemRights]::TakeOwnership
  $writers=@($folderAcl | Where-Object {
   $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin $trusted -and
   (($_.FileSystemRights -band $writeRights) -ne 0)
