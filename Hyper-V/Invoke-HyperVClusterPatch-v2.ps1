@@ -285,7 +285,7 @@ function Get-ClusterHealth([string]$Name) {
   Cluster=$Name
   CSVs=@($csv | Select-Object Name,State,OwnerNode)
   VMNotOnline=@($roles | Where-Object { (Get-PropertyText $_ 'State' 'VM cluster group') -ne 'Online' } | Select-Object Name,State,OwnerNode)
-  FailedResources=@(Get-ClusterResource -Cluster $Name | Where-Object { (Get-PropertyText $_ 'State' 'cluster resource') -eq 'Failed' } | Select-Object Name,State)
+  FailedResources=@(Get-ClusterResource -Cluster $Name | Where-Object { (Get-PropertyText $_ 'State' 'cluster resource') -eq 'Failed' } | Select-Object Name,ResourceType,State,OwnerGroup,OwnerNode)
  }
 }
 function Test-Evacuation([string[]]$Names,[object[]]$Snapshot) {
@@ -320,7 +320,12 @@ function Test-Preflight([string]$Name) {
  Assert-Ready (@($csv | Where-Object { (Get-PropertyText $_ 'State' 'CSV') -ne 'Online' }).Count -eq 0) 'CSV not Online'
  Write-Phase 'Checking cluster resources and VM roles'
  $health=Get-ClusterHealth $Name
- Assert-Ready ($health.FailedResources.Count -eq 0) 'Failed cluster resources detected'
+ if($health.FailedResources.Count -gt 0) {
+  $details=@($health.FailedResources | ForEach-Object {
+   "Resource='$($_.Name)'; Host='$($_.OwnerNode)'; Group='$($_.OwnerGroup)'; Type='$($_.ResourceType)'; State='$($_.State)'"
+  }) -join '; '
+  Assert-Ready $false "Failed cluster resources detected on $Name : $details"
+ }
  Assert-Ready ($health.VMNotOnline.Count -eq 0) 'A clustered VM role is not Online'
  Write-Phase 'Collecting node health via WinRM'
  $script:before=@(Get-NodeSnapshot -Names $script:nodes)
