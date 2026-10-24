@@ -326,7 +326,18 @@ function Test-Preflight([string]$Name) {
   }) -join '; '
   Assert-Ready $false "Failed cluster resources detected on $Name : $details"
  }
- Assert-Ready ($health.VMNotOnline.Count -eq 0) 'A clustered VM role is not Online'
+ # Offline VM roles can represent intentionally powered-off VMs; do not block CAU.
+ # Failed cluster resources are checked above independently and remain fatal.
+ $offlineRoles=@($health.VMNotOnline | Where-Object { [string]$_.State -eq 'Offline' })
+ if($offlineRoles.Count -gt 0) {
+  $offlineDetails=@($offlineRoles | ForEach-Object { "VM='$($_.Name)'; Host='$($_.OwnerNode)'; State='$($_.State)'" }) -join '; '
+  Write-Warning "Intentionally offline clustered VM roles ($($offlineRoles.Count)) on $Name (verify these are expected): $offlineDetails"
+ }
+ $unexpectedRoles=@($health.VMNotOnline | Where-Object { [string]$_.State -ne 'Offline' })
+ if($unexpectedRoles.Count -gt 0) {
+  $unexpectedDetails=@($unexpectedRoles | ForEach-Object { "VM='$($_.Name)'; Host='$($_.OwnerNode)'; State='$($_.State)'" }) -join '; '
+  Assert-Ready $false "Clustered VM roles in unexpected states on $Name : $unexpectedDetails"
+ }
  Write-Phase 'Collecting node health via WinRM'
  $script:before=@(Get-NodeSnapshot -Names $script:nodes)
  Assert-Ready ($script:before.Count -eq $script:nodes.Count) 'Incomplete node inventory'
