@@ -6,7 +6,7 @@ Audits Dell iDRAC9 local Redfish accounts against a caller-supplied allowlist an
 - Windows PowerShell 5.1 or PowerShell 7.x
 - Network access to iDRAC HTTPS (TCP 443)
 - iDRAC account with permission to enumerate local accounts
-- Valid iDRAC TLS certificate trusted by the computer running the script (certificate checks are **not** bypassed)
+- Trusted iDRAC TLS certificate by default; PowerShell 7 supports explicit `-SkipCertificateCheck` for self-signed certificates on trusted management networks
 
 ## Examples
 
@@ -54,3 +54,11 @@ When a report has no records, a matching \`.txt\` file is written instead.
 Explicitly authorized account disabling/deletion, backup-account password rotation, reserved IPMI-user checks, and IPMI-over-LAN remediation. None are included in v1.0.
 
 No company-specific credentials or inventory are included in this repository.
+
+## Self-signed iDRAC certificates
+
+On PowerShell 7, add `-SkipCertificateCheck` to audit an iDRAC with a self-signed certificate. This disables certificate verification for that run and should only be used on a trusted management network. PowerShell 5.1 does not support this option in the script.
+
+~~~powershell
+.\Invoke-iDRACSecurity.ps1 -iDRAC idrac01.example.com -ApprovedUsers root,ExampleAdmin -ApprovedUserPatterns 'OME_*' -Credential (Get-Credential) -SkipCertificateCheck
+~~~
