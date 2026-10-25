@@ -106,7 +106,7 @@ function Read-IpmiAttribute {
 }
 foreach ($hostName in $targets) {
     Write-Host "Auditing $hostName ..."
-    $count=0; $unapprovedCount=0; $status='Success'; $ipmiState='Unknown'
+    $count=0; $unapprovedCount=0; $status='Success'; $ipmiState='Unknown'; $slot1Lan='Unknown'; $slot1Serial='Unknown'
     try {
         $service = Invoke-RedfishGet -HostName $hostName -Path '/redfish/v1/AccountService'
         $accountsPath = [string]$service.Accounts.'@odata.id'
@@ -145,6 +145,12 @@ foreach ($hostName in $targets) {
                 try {
                     $attributes = Invoke-RedfishGet -HostName $hostName -Path $attributesUri
                     $ipmiState = Read-IpmiAttribute $attributes.Attributes
+                    if ($attributes.Attributes) {
+                        $lanProperty = $attributes.Attributes.PSObject.Properties['Users.1.IpmiLanPrivilege']
+                        $serialProperty = $attributes.Attributes.PSObject.Properties['Users.1.IpmiSerialPrivilege']
+                        if ($null -ne $lanProperty) { $slot1Lan = [string]$lanProperty.Value }
+                        if ($null -ne $serialProperty) { $slot1Serial = [string]$serialProperty.Value }
+                    }
                 } catch {
                     $errors.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Component='IPMIAttributes';Error=$_.Exception.Message})
                 }
@@ -156,7 +162,7 @@ foreach ($hostName in $targets) {
         $status='Failed'
         $errors.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Component='AccountAudit';Error=$_.Exception.Message})
     }
-    $ipmi.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;IPMIOverLAN=$ipmiState;ReservedIPMIUser='NotVerified';Note='Reserved IPMI slot 1 requires separate validated inspection.'})
+    $ipmi.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;IPMIOverLAN=$ipmiState;ReservedIPMIUser='NotVerified';ReservedSlot1LanPrivilege=$slot1Lan;ReservedSlot1SerialPrivilege=$slot1Serial;Note='Privileges do not establish whether reserved slot 1 is enabled. Reserved account state is not verified.'})
     $summary.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Status=$status;AccountsFound=$count;UnauthorizedFound=$unapprovedCount;IPMIOverLAN=$ipmiState})
 }
 $exports = @{
