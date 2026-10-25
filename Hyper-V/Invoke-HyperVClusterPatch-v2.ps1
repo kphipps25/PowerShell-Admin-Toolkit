@@ -692,7 +692,10 @@ try {
    $scanFinished=$true
   } else {
    $started=$true
-   $runParams=@{ClusterName=$ClusterName;CauPluginName='Microsoft.HotfixPlugin';CauPluginArguments=$pluginArgs;MaxRetriesPerNode=1;MaxFailedNodes=0;StopOnPluginFailure=$true;RequireAllNodesOnline=$true;WarnAfter=(New-TimeSpan -Hours 4);StopAfter=(New-TimeSpan -Hours 8)}
+    # Overall CAU limit: two hours overhead plus 75 minutes per cluster node.
+    $cauStopAfter=New-TimeSpan -Minutes (120 + (75 * $nodes.Count))
+    Write-Host ("CAU timeout: {0} for {1} node(s) (2 hours + 75 minutes per node)." -f $cauStopAfter,$nodes.Count)
+    $runParams=@{ClusterName=$ClusterName;CauPluginName='Microsoft.HotfixPlugin';CauPluginArguments=$pluginArgs;MaxRetriesPerNode=1;MaxFailedNodes=0;StopOnPluginFailure=$true;RequireAllNodesOnline=$true;WarnAfter=(New-TimeSpan -Hours 4);StopAfter=$cauStopAfter}
    Write-Phase 'Starting CAU patch run'
    Invoke-CauRun @runParams
   }
