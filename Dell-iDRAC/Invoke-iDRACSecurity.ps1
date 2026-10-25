@@ -21,6 +21,7 @@ param(
     [string[]]$ApprovedUserPatterns = @(),
     [pscredential]$Credential,
     [switch]$AuditOnly,
+    [switch]$SkipCertificateCheck,
     [string]$OutputFolder = (Join-Path (Get-Location).Path 'iDRAC-Audit-Reports'),
     [ValidateRange(3,120)][int]$TimeoutSeconds = 20,
     [ValidateRange(0,5)][int]$RetryCount = 1
@@ -52,6 +53,8 @@ if (-not $targets.Count) { throw 'No iDRAC targets supplied.' }
 foreach ($target in $targets) {
     if ($target -match '[/?#@\\:]' -or $target -match '^https?') { throw "Invalid target: $target. Supply hostname or IPv4 address only." }
 }
+if ($SkipCertificateCheck -and $PSVersionTable.PSVersion.Major -lt 7) { throw '-SkipCertificateCheck requires PowerShell 7 or later.' }
+if ($SkipCertificateCheck) { Write-Warning 'TLS certificate validation is disabled for this run. Use only on trusted management networks.' }
 if (-not $Credential) { $Credential = Get-Credential -Message 'iDRAC audit credential' }
 New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -70,7 +73,11 @@ function Invoke-RedfishGet {
     if (-not $Path.StartsWith('/') -or $Path.StartsWith('//')) { throw "Unsafe Redfish path: $Path" }
     $url = "https://$HostName$Path"
     for ($attempt=0; $attempt -le $RetryCount; $attempt++) {
-        try { return Invoke-RestMethod -Method Get -Uri $url -Headers $headers -TimeoutSec $TimeoutSeconds -ErrorAction Stop }
+        try {
+            $request = @{ Method='Get'; Uri=$url; Headers=$headers; TimeoutSec=$TimeoutSeconds; ErrorAction='Stop' }
+            if ($SkipCertificateCheck) { $request.SkipCertificateCheck = $true }
+            return Invoke-RestMethod @request
+        }
         catch {
             if ($attempt -eq $RetryCount) { throw "GET $Path failed: $($_.Exception.Message)" }
             Start-Sleep -Seconds ([Math]::Min(3,1+$attempt))
