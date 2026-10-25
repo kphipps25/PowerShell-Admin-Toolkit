@@ -1,0 +1,4 @@
+# Example only: one exact approved username per line
+root
+ExampleAdmin
+SNMPv3User
