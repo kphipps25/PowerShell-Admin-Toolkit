@@ -136,27 +136,17 @@ foreach ($hostName in $targets) {
             }
         }
         try {
-            $managers = Invoke-RedfishGet -HostName $hostName -Path '/redfish/v1/Managers'
-            $firstManager = @($managers.Members | Where-Object { $_ } | Select-Object -First 1)
-            if ($firstManager.Count) {
-                $managerUri = [string]$firstManager[0].'@odata.id'
-                $manager = Invoke-RedfishGet -HostName $hostName -Path $managerUri
-                $attributesUri = if ($manager.Attributes) { [string]$manager.Attributes.'@odata.id' } else { "$managerUri/Attributes" }
-                try {
-                    $attributes = Invoke-RedfishGet -HostName $hostName -Path $attributesUri
-                    $ipmiState = Read-IpmiAttribute $attributes.Attributes
-                    if ($attributes.Attributes) {
-                        $lanProperty = $attributes.Attributes.PSObject.Properties['Users.1.IpmiLanPrivilege']
-                        $serialProperty = $attributes.Attributes.PSObject.Properties['Users.1.IpmiSerialPrivilege']
-                        if ($null -ne $lanProperty) { $slot1Lan = [string]$lanProperty.Value }
-                        if ($null -ne $serialProperty) { $slot1Serial = [string]$serialProperty.Value }
-                    }
-                } catch {
-                    $errors.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Component='IPMIAttributes';Error=$_.Exception.Message})
-                }
+            # Dell iDRAC9 exposes IPMI settings at this validated OEM attributes endpoint.
+            $attributes = Invoke-RedfishGet -HostName $hostName -Path '/redfish/v1/Managers/iDRAC.Embedded.1/Attributes'
+            $ipmiState = Read-IpmiAttribute $attributes.Attributes
+            if ($attributes.Attributes) {
+                $lanProperty = $attributes.Attributes.PSObject.Properties['Users.1.IpmiLanPrivilege']
+                $serialProperty = $attributes.Attributes.PSObject.Properties['Users.1.IpmiSerialPrivilege']
+                if ($null -ne $lanProperty) { $slot1Lan = [string]$lanProperty.Value }
+                if ($null -ne $serialProperty) { $slot1Serial = [string]$serialProperty.Value }
             }
         } catch {
-            $errors.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Component='ManagerDiscovery';Error=$_.Exception.Message})
+            $errors.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Component='IPMIAttributes';Error=$_.Exception.Message})
         }
     } catch {
         $status='Failed'
