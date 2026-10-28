@@ -1,17 +1,18 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Read-only Dell iDRAC9 account and IPMI-over-LAN security audit.
+  Dell iDRAC9 security audit and opt-in local account password rotation.
 .DESCRIPTION
   Audits local Redfish accounts by username, checks an approved-user allowlist,
-  and attempts to read the Dell IPMI-over-LAN setting. Never modifies iDRAC.
+  and attempts to read the Dell IPMI-over-LAN setting. Audit mode never modifies iDRAC.
+  -ChangePassword selects a separate password-change mode; -Apply is required to write.
   Reserved IPMI slot 1 is reported NotVerified (not inferred from Redfish).
 .EXAMPLE
   .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01.example.com -ApprovedUsers root,ExampleAdmin -ApprovedUserPatterns 'OME_*'
 .EXAMPLE
   .\Invoke-iDRACSecurity.ps1 -ComputerList .\Examples\iDRAC-Servers.txt -ApprovedUsersFile .\Examples\ApprovedUsers.txt -Credential (Get-Credential)
 #>
-[CmdletBinding(DefaultParameterSetName='Single')]
+[CmdletBinding(DefaultParameterSetName='Single',SupportsShouldProcess=$true,ConfirmImpact='High')]
 param(
     [Parameter(Mandatory,ParameterSetName='Single')][string]$iDRAC,
     [Parameter(Mandatory,ParameterSetName='List')][string]$ComputerList,
@@ -21,6 +22,9 @@ param(
     [string[]]$ApprovedUserPatterns = @(),
     [pscredential]$Credential,
     [switch]$AuditOnly,
+    [switch]$ChangePassword,
+    [switch]$Apply,
+    [string]$Username,
     [switch]$SkipCertificateCheck,
     [string]$OutputFolder = (Join-Path (Get-Location).Path 'iDRAC-Audit-Reports'),
     [ValidateRange(3,120)][int]$TimeoutSeconds = 20,
@@ -34,7 +38,7 @@ if ($ApprovedUsersFile) {
 }
 $ApprovedUsers = @($ApprovedUsers | Where-Object { $_ } | Select-Object -Unique)
 $ApprovedUserPatterns = @($ApprovedUserPatterns | Where-Object { $_ } | Select-Object -Unique)
-if (-not $ApprovedUsers.Count -and -not $ApprovedUserPatterns.Count) { throw 'Specify an approved username or pattern. An empty allowlist is not permitted.' }
+if (-not $ChangePassword -and -not $ApprovedUsers.Count -and -not $ApprovedUserPatterns.Count) { throw 'Specify an approved username or pattern. An empty allowlist is not permitted.' }
 $targets = switch ($PSCmdlet.ParameterSetName) {
     'Single' { @($iDRAC) }
     'List' {
@@ -56,6 +60,23 @@ foreach ($target in $targets) {
 if ($SkipCertificateCheck -and $PSVersionTable.PSVersion.Major -lt 7) { throw '-SkipCertificateCheck requires PowerShell 7 or later.' }
 if ($SkipCertificateCheck) { Write-Warning 'TLS certificate validation is disabled for this run. Use only on trusted management networks.' }
 if (-not $Credential) { $Credential = Get-Credential -Message 'iDRAC audit credential' }
+# Password changes are a separate mode. Default audit remains read-only.
+if ($Apply -and -not $ChangePassword) { throw '-Apply is only valid with -ChangePassword.' }
+if ($ChangePassword -and $AuditOnly) { throw '-AuditOnly cannot be combined with -ChangePassword.' }
+if ($ChangePassword) {
+    if (-not $Username) { $Username = Read-Host 'Local iDRAC username to update' }
+    if ([string]::IsNullOrWhiteSpace($Username)) { throw 'Username is required.' }
+    $Username = $Username.Trim()
+    $newPassword = $null
+    if ($Apply) {
+        $newPassword = Read-Host 'New password' -AsSecureString
+        $again = Read-Host 'Confirm new password' -AsSecureString
+        $a = [System.Net.NetworkCredential]::new('', $newPassword).Password
+        $b = [System.Net.NetworkCredential]::new('', $again).Password
+        if (-not $a -or $a -cne $b) { throw 'New passwords do not match or are empty.' }
+        $a = $null; $b = $null; $again.Dispose()
+    }
+}
 New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
 $inventory = [System.Collections.Generic.List[object]]::new()
@@ -103,6 +124,52 @@ function Read-IpmiAttribute {
         }
     }
     return 'Unknown'
+}
+if ($ChangePassword) {
+    $passwordResults = [System.Collections.Generic.List[object]]::new()
+    foreach ($hostName in $targets) {
+        $state='Failed'; $detail=''; $accountUri=''
+        Write-Host "Checking account '$Username' on $hostName ..."
+        try {
+            $service = Invoke-RedfishGet -HostName $hostName -Path '/redfish/v1/AccountService'
+            $collectionPath = [string]$service.Accounts.'@odata.id'
+            if (-not $collectionPath) { throw 'AccountService did not provide Accounts URI.' }
+            $collection = Invoke-RedfishGet -HostName $hostName -Path $collectionPath
+            $matches = @()
+            foreach ($member in @($collection.Members)) {
+                $uri = [string]$member.'@odata.id'
+                if (-not $uri -or -not $uri.StartsWith('/') -or $uri.StartsWith('//') -or $uri.Contains('?') -or $uri.Contains('#')) { continue }
+                $account = Invoke-RedfishGet -HostName $hostName -Path $uri
+                if ([string]$account.UserName -ceq $Username) { $matches += $uri }
+            }
+            if ($matches.Count -ne 1) { throw "Expected exactly one account matching '$Username'; found $($matches.Count)." }
+            $accountUri = $matches[0]
+            if (-not $Apply) {
+                $state='WouldChange'
+            } elseif ($PSCmdlet.ShouldProcess("$hostName / $Username", 'Change local iDRAC password')) {
+                $url = "https://$hostName$accountUri"
+                $plain = [System.Net.NetworkCredential]::new('', $newPassword).Password
+                try {
+                    $payload = @{Password=$plain} | ConvertTo-Json -Compress
+                    $req = @{Method='Patch';Uri=$url;Headers=$headers;Body=$payload;ContentType='application/json';TimeoutSec=$TimeoutSeconds;ErrorAction='Stop'}
+                    if ($SkipCertificateCheck) { $req.SkipCertificateCheck=$true }
+                    $null = Invoke-RestMethod @req
+                } finally { $plain=$null; $payload=$null }
+                $state='PatchAccepted'
+                $detail='PATCH accepted; verify authentication separately using new password.'
+            } else { $state='Skipped' }
+        } catch {
+            $detail=$_.Exception.Message
+        }
+        $passwordResults.Add([pscustomobject]@{Timestamp=(Get-Date).ToString('o');iDRAC=$hostName;Username=$Username;AccountUri=$accountUri;Status=$state;Detail=$detail})
+    }
+    $passwordReport = Join-Path $OutputFolder "iDRAC-PasswordChange-$runId.csv"
+    $passwordResults | Export-Csv -Path $passwordReport -NoTypeInformation -Encoding UTF8
+    $headers.Clear(); $authString=$null
+    if ($null -ne $newPassword) { $newPassword.Dispose() }
+    Write-Host "Password mode complete. Report: $passwordReport"
+    $passwordResults | Format-Table iDRAC,Username,Status -AutoSize
+    return
 }
 foreach ($hostName in $targets) {
     Write-Host "Auditing $hostName ..."
