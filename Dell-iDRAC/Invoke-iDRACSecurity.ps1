@@ -5,7 +5,7 @@
 .DESCRIPTION
   Audits local Redfish accounts by username, checks an approved-user allowlist,
   and attempts to read the Dell IPMI-over-LAN setting. Audit mode never modifies iDRAC.
-  -ChangePassword selects a separate password-change mode; -Apply is required to write.
+  -ChangePassword or -ChangeRole selects a separate management mode; -Apply is required to write.
   Reserved IPMI slot 1 is reported NotVerified (not inferred from Redfish).
 .EXAMPLE
   .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01.example.com -ApprovedUsers root,ExampleAdmin -ApprovedUserPatterns 'OME_*'
@@ -23,6 +23,8 @@ param(
     [pscredential]$Credential,
     [switch]$AuditOnly,
     [switch]$ChangePassword,
+    [switch]$ChangeRole,
+    [ValidateSet('Administrator','Operator','ReadOnly','None')][string]$RoleID,
     [switch]$Apply,
     [string]$Username,
     [switch]$SkipCertificateCheck,
@@ -38,7 +40,7 @@ if ($ApprovedUsersFile) {
 }
 $ApprovedUsers = @($ApprovedUsers | Where-Object { $_ } | Select-Object -Unique)
 $ApprovedUserPatterns = @($ApprovedUserPatterns | Where-Object { $_ } | Select-Object -Unique)
-if (-not $ChangePassword -and -not $ApprovedUsers.Count -and -not $ApprovedUserPatterns.Count) { throw 'Specify an approved username or pattern. An empty allowlist is not permitted.' }
+if (-not ($ChangePassword -or $ChangeRole) -and -not $ApprovedUsers.Count -and -not $ApprovedUserPatterns.Count) { throw 'Specify an approved username or pattern. An empty allowlist is not permitted.' }
 $targets = switch ($PSCmdlet.ParameterSetName) {
     'Single' { @($iDRAC) }
     'List' {
@@ -61,14 +63,17 @@ if ($SkipCertificateCheck -and $PSVersionTable.PSVersion.Major -lt 7) { throw '-
 if ($SkipCertificateCheck) { Write-Warning 'TLS certificate validation is disabled for this run. Use only on trusted management networks.' }
 if (-not $Credential) { $Credential = Get-Credential -Message 'iDRAC audit credential' }
 # Password changes are a separate mode. Default audit remains read-only.
-if ($Apply -and -not $ChangePassword) { throw '-Apply is only valid with -ChangePassword.' }
-if ($ChangePassword -and $AuditOnly) { throw '-AuditOnly cannot be combined with -ChangePassword.' }
-if ($ChangePassword) {
+if ($ChangePassword -and $ChangeRole) { throw 'Choose one management mode.' }
+if ($Apply -and -not ($ChangePassword -or $ChangeRole)) { throw '-Apply requires a management mode.' }
+if ($ChangeRole -and -not $RoleID) { throw '-RoleID is required with -ChangeRole.' }
+if ($RoleID -and -not $ChangeRole) { throw '-RoleID requires -ChangeRole.' }
+if (($ChangePassword -or $ChangeRole) -and $AuditOnly) { throw '-AuditOnly cannot be combined with -ChangePassword.' }
+if ($ChangePassword -or $ChangeRole) {
     if (-not $Username) { $Username = Read-Host 'Local iDRAC username to update' }
     if ([string]::IsNullOrWhiteSpace($Username)) { throw 'Username is required.' }
     $Username = $Username.Trim()
     $newPassword = $null
-    if ($Apply) {
+    if ($Apply -and $ChangePassword) {
         $newPassword = Read-Host 'New password' -AsSecureString
         $again = Read-Host 'Confirm new password' -AsSecureString
         $a = [System.Net.NetworkCredential]::new('', $newPassword).Password
@@ -125,10 +130,10 @@ function Read-IpmiAttribute {
     }
     return 'Unknown'
 }
-if ($ChangePassword) {
+if ($ChangePassword -or $ChangeRole) {
     $passwordResults = [System.Collections.Generic.List[object]]::new()
     foreach ($hostName in $targets) {
-        $state='Failed'; $detail=''; $accountUri=''
+        $state='Failed'; $detail=''; $accountUri=''; $beforeRole=''; $afterRole=''
         Write-Host "Checking account '$Username' on $hostName ..."
         try {
             $service = Invoke-RedfishGet -HostName $hostName -Path '/redfish/v1/AccountService'
@@ -140,30 +145,43 @@ if ($ChangePassword) {
                 $uri = [string]$member.'@odata.id'
                 if (-not $uri -or -not $uri.StartsWith('/') -or $uri.StartsWith('//') -or $uri.Contains('?') -or $uri.Contains('#')) { continue }
                 $account = Invoke-RedfishGet -HostName $hostName -Path $uri
-                if ([string]$account.UserName -ceq $Username) { $matches += $uri }
+                if ([string]$account.UserName -ceq $Username) { $matches += [pscustomobject]@{Uri=$uri;Role=[string]$account.RoleId} }
             }
             if ($matches.Count -ne 1) { throw "Expected exactly one account matching '$Username'; found $($matches.Count)." }
-            $accountUri = $matches[0]
-            if (-not $Apply) {
+            $accountUri = [string]$matches[0].Uri
+            $beforeRole = [string]$matches[0].Role
+            if ($ChangeRole -and $beforeRole -ceq $RoleID) { $state='AlreadyCompliant'; $afterRole=$beforeRole }
+            elseif (-not $Apply) {
                 $state='WouldChange'
-            } elseif ($PSCmdlet.ShouldProcess("$hostName / $Username", 'Change local iDRAC password')) {
+            } elseif ($PSCmdlet.ShouldProcess("$hostName / $Username", $(if ($ChangeRole) { "Change role to $RoleID" } else { 'Change local iDRAC password' }))) {
                 $url = "https://$hostName$accountUri"
-                $plain = [System.Net.NetworkCredential]::new('', $newPassword).Password
+                $plain=$null; $payload=$null
                 try {
-                    $payload = @{Password=$plain} | ConvertTo-Json -Compress
-                    $req = @{Method='Patch';Uri=$url;Headers=$headers;Body=$payload;ContentType='application/json';TimeoutSec=$TimeoutSeconds;ErrorAction='Stop'}
+                    if ($ChangeRole) { $payload=@{RoleId=$RoleID} | ConvertTo-Json -Compress }
+                    else {
+                        $plain=[System.Net.NetworkCredential]::new('', $newPassword).Password
+                        $payload=@{Password=$plain} | ConvertTo-Json -Compress
+                    }
+                    $req=@{Method='Patch';Uri=$url;Headers=$headers;Body=$payload;ContentType='application/json';TimeoutSec=$TimeoutSeconds;ErrorAction='Stop'}
                     if ($SkipCertificateCheck) { $req.SkipCertificateCheck=$true }
-                    $null = Invoke-RestMethod @req
+                    $null=Invoke-RestMethod @req
                 } finally { $plain=$null; $payload=$null }
-                $state='PatchAccepted'
-                $detail='PATCH accepted; verify authentication separately using new password.'
+                if ($ChangeRole) {
+                    $updated=Invoke-RedfishGet -HostName $hostName -Path $accountUri
+                    $afterRole=[string]$updated.RoleId
+                    if ($afterRole -ceq $RoleID) { $state='Verified' }
+                    else { $state='VerificationMismatch'; $detail="RoleId readback: $afterRole" }
+                } else {
+                    $state='PatchAccepted'
+                    $detail='PATCH accepted; verify authentication separately using new password.'
+                }
             } else { $state='Skipped' }
         } catch {
             $detail=$_.Exception.Message
         }
-        $passwordResults.Add([pscustomobject]@{Timestamp=(Get-Date).ToString('o');iDRAC=$hostName;Username=$Username;AccountUri=$accountUri;Status=$state;Detail=$detail})
+        $passwordResults.Add([pscustomobject]@{Timestamp=(Get-Date).ToString('o');iDRAC=$hostName;Username=$Username;AccountUri=$accountUri;BeforeRoleID=$beforeRole;RequestedRoleID=$(if ($ChangeRole) {$RoleID} else {''});AfterRoleID=$afterRole;Status=$state;Detail=$detail})
     }
-    $passwordReport = Join-Path $OutputFolder "iDRAC-PasswordChange-$runId.csv"
+    $passwordReport = Join-Path $OutputFolder "iDRAC-AccountChange-$runId.csv"
     $passwordResults | Export-Csv -Path $passwordReport -NoTypeInformation -Encoding UTF8
     $headers.Clear(); $authString=$null
     if ($null -ne $newPassword) { $newPassword.Dispose() }
