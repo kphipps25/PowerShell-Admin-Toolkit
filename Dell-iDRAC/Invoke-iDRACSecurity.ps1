@@ -6,6 +6,8 @@
   Audits local Redfish accounts by username, checks an approved-user allowlist,
   and attempts to read the Dell IPMI-over-LAN setting. Audit mode never modifies iDRAC.
   -ChangePassword or -ChangeRole selects a separate management mode; -Apply is required to write.
+  Reports per-account IPMI LAN/serial privilege and SOL setting when Dell OEM
+  Users.<slot> attributes are exposed. Missing values are Unknown, not Disabled.
   Reserved IPMI slot 1 is reported NotVerified (not inferred from Redfish).
 .EXAMPLE
   .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01.example.com -ApprovedUsers root,ExampleAdmin -ApprovedUserPatterns 'OME_*'
@@ -198,6 +200,21 @@ foreach ($hostName in $targets) {
         if (-not $accountsPath) { throw 'AccountService did not return Accounts URI.' }
         $collection = Invoke-RedfishGet -HostName $hostName -Path $accountsPath
         $members = @($collection.Members | Where-Object { $_ })
+        # Read Dell OEM attributes once per controller. Missing attributes are reported as Unknown.
+        $oemAttributes = $null
+        try {
+            $oemResponse = Invoke-RedfishGet -HostName $hostName -Path '/redfish/v1/Managers/iDRAC.Embedded.1/Attributes'
+            $oemAttributes = $oemResponse.Attributes
+            $ipmiState = Read-IpmiAttribute $oemAttributes
+            if ($oemAttributes) {
+                $p = $oemAttributes.PSObject.Properties['Users.1.IpmiLanPrivilege']
+                if ($null -ne $p) { $slot1Lan = [string]$p.Value }
+                $p = $oemAttributes.PSObject.Properties['Users.1.IpmiSerialPrivilege']
+                if ($null -ne $p) { $slot1Serial = [string]$p.Value }
+            }
+        } catch {
+            $errors.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Component='IPMIAttributes';Error=$_.Exception.Message})
+        }
         $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
         foreach ($member in $members) {
             $uri = [string]$member.'@odata.id'
@@ -209,7 +226,62 @@ foreach ($hostName in $targets) {
             [void]$seen.Add($name)
             $approved = Test-ApprovedName $name
             $accountId = [string]$account.Id
-            $inventory.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;AccountId=$accountId;Username=$name;Enabled=$account.Enabled;RoleId=$account.RoleId;Approved=$approved;AccountUri=$uri})
+            $lanPrivilege='Unknown'; $serialPrivilege='Unknown'; $solEnabled='Unknown'
+            # Redfish Account Id is expected to match Dell's Users.<slot> attributes on iDRAC9.
+            # Do not guess when the account Id is not a numeric slot.
+            if ($oemAttributes -and $accountId -match '^[0-9]+
+            if (-not $approved) {
+                $unapprovedCount++
+                $unauthorized.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;AccountId=$accountId;Username=$name;Enabled=$account.Enabled;Reason='Not approved'})
+            }
+        }
+        foreach ($required in $ApprovedUsers) {
+            if (-not $seen.Contains($required)) {
+                $missing.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Username=$required;Reason='Required username missing'})
+            }
+        }
+
+    } catch {
+        $status='Failed'
+        $errors.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Component='AccountAudit';Error=$_.Exception.Message})
+    }
+    $ipmi.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;IPMIOverLAN=$ipmiState;ReservedIPMIUser='NotVerified';ReservedSlot1LanPrivilege=$slot1Lan;ReservedSlot1SerialPrivilege=$slot1Serial;Note='Privileges do not establish whether reserved slot 1 is enabled. Reserved account state is not verified.'})
+    $summary.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Status=$status;AccountsFound=$count;UnauthorizedFound=$unapprovedCount;IPMIOverLAN=$ipmiState})
+}
+$exports = @{
+    'iDRAC-AccountInventory'=$inventory
+    'iDRAC-UnauthorizedUsers'=$unauthorized
+    'iDRAC-MissingUsers'=$missing
+    'iDRAC-IPMISecurity'=$ipmi
+    'iDRAC-AuditErrors'=$errors
+    'iDRAC-AuditSummary'=$summary
+}
+foreach ($key in $exports.Keys) {
+    $path = Join-Path $OutputFolder "$key-$runId.csv"
+    if ($exports[$key].Count) { $exports[$key] | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8 }
+    else { 'No records' | Set-Content -Path (Join-Path $OutputFolder "$key-$runId.txt") -Encoding UTF8 }
+}
+$headers.Clear()
+$authString=$null
+Write-Host "Read-only audit complete. Reports: $OutputFolder"
+$summary | Format-Table -AutoSize
+) {
+                $slot = [int]$accountId
+                foreach ($entry in @(
+                    @{Key="Users.$slot.IpmiLanPrivilege";Name='Lan'},
+                    @{Key="Users.$slot.IpmiSerialPrivilege";Name='Serial'},
+                    @{Key="Users.$slot.SolEnable";Name='Sol'}
+                )) {
+                    $prop = $oemAttributes.PSObject.Properties[$entry.Key]
+                    if ($null -eq $prop) { continue }
+                    switch ($entry.Name) {
+                        'Lan' { $lanPrivilege = [string]$prop.Value }
+                        'Serial' { $serialPrivilege = [string]$prop.Value }
+                        'Sol' { $solEnabled = [string]$prop.Value }
+                    }
+                }
+            }
+            $inventory.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;AccountId=$accountId;Username=$name;Enabled=$account.Enabled;RoleId=$account.RoleId;IPMILanPrivilege=$lanPrivilege;IPMISerialPrivilege=$serialPrivilege;SerialOverLAN=$solEnabled;IPMIOverLAN=$ipmiState;Approved=$approved;AccountUri=$uri})
             if (-not $approved) {
                 $unapprovedCount++
                 $unauthorized.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;AccountId=$accountId;Username=$name;Enabled=$account.Enabled;Reason='Not approved'})
