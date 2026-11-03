@@ -7,6 +7,7 @@
   and attempts to read the Dell IPMI-over-LAN setting. Audit mode never modifies iDRAC.
   -ChangePassword, -ChangeRole, -DisableUnauthorized or -RemoveUnauthorized select
   separate management modes. -Apply is required to write. Default audit is read-only.
+  Removal disables the slot and clears its role, then clears its username using PATCH.
   Reports per-account IPMI LAN/serial privilege and SOL setting when Dell OEM
   Users.<slot> attributes are exposed. Missing values are Unknown, not Disabled.
   Reserved IPMI slot 1 is reported NotVerified (not inferred from Redfish).
@@ -32,7 +33,7 @@
   # Preview permanent removal; -Apply is required and prompts for each account.
   .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,ExampleAdmin,ExampleMonitoring,ExampleScanner -ApprovedUserPatterns 'OME_*' -RemoveUnauthorized
 .EXAMPLE
-  # Permanently remove unauthorized users on one controller (review preview first).
+  # Clear unauthorized account slots via two Redfish PATCH requests; review preview first.
   .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,ExampleAdmin,ExampleMonitoring,ExampleScanner -ApprovedUserPatterns 'OME_*' -RemoveUnauthorized -Apply
 #>
 [CmdletBinding(DefaultParameterSetName='Single',SupportsShouldProcess=$true,ConfirmImpact='High')]
@@ -185,17 +186,34 @@ if ($DisableUnauthorized -or $RemoveUnauthorized) {
                 } elseif ($Apply) {
                     try {
                         if ($PSCmdlet.ShouldProcess("$hostName / $name / $accountId", "$action unauthorized local account")) {
-                            $request = @{Method=$(if ($DisableUnauthorized) {'Patch'} else {'Delete'});Uri="https://$hostName$uri";Headers=$headers;TimeoutSec=$TimeoutSeconds;ErrorAction='Stop'}
-                            if ($DisableUnauthorized) { $request.Body = '{"Enabled":false}'; $request.ContentType='application/json' }
+                            $request = @{Method='Patch';Uri="https://$hostName$uri";Headers=$headers;TimeoutSec=$TimeoutSeconds;ErrorAction='Stop';ContentType='application/json'}
                             if ($SkipCertificateCheck) { $request.SkipCertificateCheck=$true }
-                            $null = Invoke-RestMethod @request
                             if ($DisableUnauthorized) {
+                                $request.Body = '{"Enabled":false}'
+                                $null = Invoke-RestMethod @request
                                 $check = Invoke-RedfishGet -HostName $hostName -Path $uri
                                 if ($check.Enabled -eq $false) { $state='VerifiedDisabled' }
                                 else { $state='VerificationFailed'; $detail='Account still enabled after PATCH.' }
                             } else {
-                                $state='DeleteAccepted'
-                                $detail='DELETE accepted; independently confirm account is absent.'
+                                # Dell account-slot removal: first disable and clear role,
+                                # then clear username. Do not use HTTP DELETE (405 on iDRAC).
+                                $request.Body = '{"Enabled":false,"RoleId":"None"}'
+                                $null = Invoke-RestMethod @request
+                                $check = Invoke-RedfishGet -HostName $hostName -Path $uri
+                                if ($check.Enabled -ne $false -or [string]$check.RoleId -ne 'None') {
+                                    $state='VerificationFailed'
+                                    $detail='First PATCH did not confirm Enabled=false and RoleId=None; username was not cleared.'
+                                } else {
+                                    $request.Body = '{"UserName":""}'
+                                    $null = Invoke-RestMethod @request
+                                    $check = Invoke-RedfishGet -HostName $hostName -Path $uri
+                                    if ([string]::IsNullOrWhiteSpace([string]$check.UserName) -and $check.Enabled -eq $false) {
+                                        $state='VerifiedRemoved'
+                                    } else {
+                                        $state='VerificationFailed'
+                                        $detail='Username was not cleared or account is still enabled after second PATCH.'
+                                    }
+                                }
                             }
                         } else { $state='Skipped' }
                     } catch { $state='Failed'; $detail=$_.Exception.Message }
