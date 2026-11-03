@@ -12,28 +12,28 @@
   Reserved IPMI slot 1 is reported NotVerified (not inferred from Redfish).
 .EXAMPLE
   # Read-only audit for one controller.
-  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,umpquaadmin -ApprovedUserPatterns 'OME_*'
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,ExampleAdmin -ApprovedUserPatterns 'OME_*'
 .EXAMPLE
   # Read-only audit from CSV (CSV header must be iDRAC).
-  .\Invoke-iDRACSecurity.ps1 -InputCsv .\iDRAC_List.csv -ApprovedUsers root,umpquaadmin -ApprovedUserPatterns 'OME_*' -SkipCertificateCheck
+  .\Invoke-iDRACSecurity.ps1 -InputCsv .\iDRAC_List.csv -ApprovedUsers root,ExampleAdmin -ApprovedUserPatterns 'OME_*' -SkipCertificateCheck
 .EXAMPLE
   # Preview password change, then add -Apply to change it (prompts for username/password).
-  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ChangePassword -Username umpquaadmin
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ChangePassword -Username ExampleAdmin
 .EXAMPLE
   # Change account role; omit -Apply for preview.
-  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ChangeRole -Username umpquaadmin -RoleID ReadOnly -Apply
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ChangeRole -Username ExampleAdmin -RoleID ReadOnly -Apply
 .EXAMPLE
   # Preview disabling unapproved users; no changes without -Apply.
-  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,umpquaadmin,SNMPv3User,forescoutscan -ApprovedUserPatterns 'OME_*' -DisableUnauthorized
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,ExampleAdmin,ExampleMonitoring,ExampleScanner -ApprovedUserPatterns 'OME_*' -DisableUnauthorized
 .EXAMPLE
   # Disable unapproved users on one controller (prompts for each change).
-  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,umpquaadmin,SNMPv3User,forescoutscan -ApprovedUserPatterns 'OME_*' -DisableUnauthorized -Apply
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,ExampleAdmin,ExampleMonitoring,ExampleScanner -ApprovedUserPatterns 'OME_*' -DisableUnauthorized -Apply
 .EXAMPLE
   # Preview permanent removal; -Apply is required and prompts for each account.
-  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,umpquaadmin,SNMPv3User,forescoutscan -ApprovedUserPatterns 'OME_*' -RemoveUnauthorized
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,ExampleAdmin,ExampleMonitoring,ExampleScanner -ApprovedUserPatterns 'OME_*' -RemoveUnauthorized
 .EXAMPLE
   # Permanently remove unauthorized users on one controller (review preview first).
-  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,umpquaadmin,SNMPv3User,forescoutscan -ApprovedUserPatterns 'OME_*' -RemoveUnauthorized -Apply
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,ExampleAdmin,ExampleMonitoring,ExampleScanner -ApprovedUserPatterns 'OME_*' -RemoveUnauthorized -Apply
 #>
 [CmdletBinding(DefaultParameterSetName='Single',SupportsShouldProcess=$true,ConfirmImpact='High')]
 param(
