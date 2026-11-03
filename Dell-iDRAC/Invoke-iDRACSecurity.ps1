@@ -262,7 +262,8 @@ if ($ChangePassword -or $ChangeRole) {
             $emptySlots = @()
             foreach ($member in @($collection.Members)) {
                 $uri = [string]$member.'@odata.id'
-                if (-not $uri -or $uri -notmatch '^/redfish/v1/AccountService/Accounts/([0-9]+)
+                if (-not $uri -or $uri -notmatch '^/redfish/v1/AccountService/Accounts/([0-9]+)$') { continue }
+                $slotId = [int]$Matches[1]
                 $account = Invoke-RedfishGet -HostName $hostName -Path $uri
                 if ([string]$account.UserName -ceq $Username) {
                     $matchingAccounts += [pscustomobject]@{Uri=$uri;Role=[string]$account.RoleId}
