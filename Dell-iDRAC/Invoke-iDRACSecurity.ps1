@@ -258,21 +258,20 @@ if ($ChangePassword -or $ChangeRole) {
             $collectionPath = [string]$service.Accounts.'@odata.id'
             if (-not $collectionPath) { throw 'AccountService did not provide Accounts URI.' }
             $collection = Invoke-RedfishGet -HostName $hostName -Path $collectionPath
-            $matches = @()
+            $matchingAccounts = @()
             $emptySlots = @()
             foreach ($member in @($collection.Members)) {
                 $uri = [string]$member.'@odata.id'
-                if (-not $uri -or $uri -notmatch '^/redfish/v1/AccountService/Accounts/([0-9]+)$') { continue }
-                $slotId = [int]$Matches[1]
+                if (-not $uri -or $uri -notmatch '^/redfish/v1/AccountService/Accounts/([0-9]+)
                 $account = Invoke-RedfishGet -HostName $hostName -Path $uri
                 if ([string]$account.UserName -ceq $Username) {
-                    $matches += [pscustomobject]@{Uri=$uri;Role=[string]$account.RoleId}
+                    $matchingAccounts += [pscustomobject]@{Uri=$uri;Role=[string]$account.RoleId}
                 } elseif ($slotId -gt 1 -and [string]::IsNullOrWhiteSpace([string]$account.UserName) -and $account.Enabled -eq $false) {
                     $emptySlots += [pscustomobject]@{Uri=$uri;Slot=$slotId}
                 }
             }
-            if ($matches.Count -gt 1) { throw "Multiple accounts match '$Username'; refusing to modify." }
-            if ($matches.Count -eq 0) {
+            if ($matchingAccounts.Count -gt 1) { throw "Multiple accounts match '$Username'; refusing to modify." }
+            if ($matchingAccounts.Count -eq 0) {
                 if (-not ($ChangePassword -and $CreateIfMissing)) { throw "Account '$Username' not found." }
                 if (-not $emptySlots.Count) { throw 'No empty disabled Redfish account slot available.' }
                 $slot = @($emptySlots | Sort-Object Slot | Select-Object -First 1)[0]
@@ -299,8 +298,46 @@ if ($ChangePassword -or $ChangeRole) {
                 $passwordResults.Add([pscustomobject]@{Timestamp=(Get-Date).ToString('o');iDRAC=$hostName;Username=$Username;AccountUri=$accountUri;BeforeRoleID='';RequestedRoleID=$RoleID;AfterRoleID=$afterRole;Status=$state;Detail=$detail})
                 continue
             }
-            $accountUri = [string]$matches[0].Uri
-            $beforeRole = [string]$matches[0].Role
+) { continue }
+                $slotMatch = $Matches
+                $slotId = [int]$slotMatch[1]
+                $account = Invoke-RedfishGet -HostName $hostName -Path $uri
+                if ([string]$account.UserName -ceq $Username) {
+                    $matchingAccounts += [pscustomobject]@{Uri=$uri;Role=[string]$account.RoleId}
+                } elseif ($slotId -gt 1 -and [string]::IsNullOrWhiteSpace([string]$account.UserName) -and $account.Enabled -eq $false) {
+                    $emptySlots += [pscustomobject]@{Uri=$uri;Slot=$slotId}
+                }
+            }
+            if ($matchingAccounts.Count -gt 1) { throw "Multiple accounts match '$Username'; refusing to modify." }
+            if ($matchingAccounts.Count -eq 0) {
+                if (-not ($ChangePassword -and $CreateIfMissing)) { throw "Account '$Username' not found." }
+                if (-not $emptySlots.Count) { throw 'No empty disabled Redfish account slot available.' }
+                $slot = @($emptySlots | Sort-Object Slot | Select-Object -First 1)[0]
+                $accountUri = [string]$slot.Uri
+                if (-not $Apply) {
+                    $state='WouldCreate'; $detail="New account role: $RoleID; empty slot: $($slot.Slot)"
+                } elseif ($PSCmdlet.ShouldProcess("$hostName / $Username / slot $($slot.Slot)", "Create local account with role $RoleID")) {
+                    $plain=$null; $payload=$null
+                    try {
+                        $plain=[System.Net.NetworkCredential]::new('', $newPassword).Password
+                        $payload=@{UserName=$Username;Password=$plain;RoleId=$RoleID;Enabled=$true} | ConvertTo-Json -Compress
+                        $req=@{Method='Patch';Uri="https://$hostName$accountUri";Headers=$headers;Body=$payload;ContentType='application/json';TimeoutSec=$TimeoutSeconds;ErrorAction='Stop'}
+                        if ($SkipCertificateCheck) { $req.SkipCertificateCheck=$true }
+                        $null=Invoke-RestMethod @req
+                    } finally { $plain=$null; $payload=$null }
+                    $created=Invoke-RedfishGet -HostName $hostName -Path $accountUri
+                    if ([string]$created.UserName -ceq $Username -and $created.Enabled -eq $true -and [string]$created.RoleId -ceq $RoleID) {
+                        $state='VerifiedCreated'; $afterRole=[string]$created.RoleId
+                        $detail='Account properties verified; verify password by authenticating separately.'
+                    } else {
+                        $state='VerificationMismatch'; $detail='Account properties did not match requested values.'
+                    }
+                } else { $state='Skipped' }
+                $passwordResults.Add([pscustomobject]@{Timestamp=(Get-Date).ToString('o');iDRAC=$hostName;Username=$Username;AccountUri=$accountUri;BeforeRoleID='';RequestedRoleID=$RoleID;AfterRoleID=$afterRole;Status=$state;Detail=$detail})
+                continue
+            }
+            $accountUri = [string]$matchingAccounts[0].Uri
+            $beforeRole = [string]$matchingAccounts[0].Role
             if ($ChangeRole -and $beforeRole -ceq $RoleID) { $state='AlreadyCompliant'; $afterRole=$beforeRole }
             elseif (-not $Apply) {
                 $state='WouldChange'
