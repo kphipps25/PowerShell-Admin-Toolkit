@@ -208,7 +208,7 @@ if ($DisableUnauthorized -or $RemoveUnauthorized) {
     }
     $report = Join-Path $OutputFolder "iDRAC-Unauthorized-$action-$runId.csv"
     if ($cleanup.Count) { $cleanup | Export-Csv -LiteralPath $report -NoTypeInformation -Encoding UTF8 }
-    else { 'No unauthorized accounts found' | Set-Content -LiteralPath ($report -replace '\.csv
+    else { Write-Host 'No unauthorized accounts found; no CSV generated.' }
     $headers.Clear(); $authString=$null
     Write-Host "Unauthorized account $action report: $report"
     $cleanup | Format-Table iDRAC,Username,Action,Status -AutoSize
