@@ -229,7 +229,23 @@ foreach ($hostName in $targets) {
             $lanPrivilege='Unknown'; $serialPrivilege='Unknown'; $solEnabled='Unknown'
             # Redfish Account Id is expected to match Dell's Users.<slot> attributes on iDRAC9.
             # Do not guess when the account Id is not a numeric slot.
-            if ($oemAttributes -and $accountId -match '^[0-9]+
+            if ($oemAttributes -and $accountId -match '^[0-9]+$') {
+                $slot = [int]$accountId
+                foreach ($entry in @(
+                    @{Key="Users.$slot.IpmiLanPrivilege";Name='Lan'},
+                    @{Key="Users.$slot.IpmiSerialPrivilege";Name='Serial'},
+                    @{Key="Users.$slot.SolEnable";Name='Sol'}
+                )) {
+                    $prop = $oemAttributes.PSObject.Properties[$entry.Key]
+                    if ($null -eq $prop) { continue }
+                    switch ($entry.Name) {
+                        'Lan' { $lanPrivilege = [string]$prop.Value }
+                        'Serial' { $serialPrivilege = [string]$prop.Value }
+                        'Sol' { $solEnabled = [string]$prop.Value }
+                    }
+                }
+            }
+            $inventory.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;AccountId=$accountId;Username=$name;Enabled=$account.Enabled;RoleId=$account.RoleId;IPMILanPrivilege=$lanPrivilege;IPMISerialPrivilege=$serialPrivilege;SerialOverLAN=$solEnabled;IPMIOverLAN=$ipmiState;Approved=$approved;AccountUri=$uri})
             if (-not $approved) {
                 $unapprovedCount++
                 $unauthorized.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;AccountId=$accountId;Username=$name;Enabled=$account.Enabled;Reason='Not approved'})
