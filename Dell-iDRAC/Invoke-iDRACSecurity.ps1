@@ -8,6 +8,7 @@
   -ChangePassword, -ChangeRole, -DisableUnauthorized or -RemoveUnauthorized select
   separate management modes. -Apply is required to write. Default audit is read-only.
   Removal disables the slot and clears its role, then clears its username using PATCH.
+  -ChangePassword -CreateIfMissing prompts for the role of new accounts (or use -RoleID).
   Reports per-account IPMI LAN/serial privilege and SOL setting when Dell OEM
   Users.<slot> attributes are exposed. Missing values are Unknown, not Disabled.
   Reserved IPMI slot 1 is reported NotVerified (not inferred from Redfish).
@@ -20,6 +21,12 @@
 .EXAMPLE
   # Preview password change, then add -Apply to change it (prompts for username/password).
   .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ChangePassword -Username ExampleAdmin
+.EXAMPLE
+  # Preview password rotation and creation of missing accounts. Prompts once for the new account role.
+  .\Invoke-iDRACSecurity.ps1 -InputCsv .\iDRAC_List.csv -ChangePassword -CreateIfMissing -Username ExampleAdmin
+.EXAMPLE
+  # Rotate password and create missing accounts with the same prompted password; prompts for new-account role.
+  .\Invoke-iDRACSecurity.ps1 -InputCsv .\iDRAC_List.csv -ChangePassword -CreateIfMissing -Username ExampleAdmin -Apply
 .EXAMPLE
   # Change account role; omit -Apply for preview.
   .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ChangeRole -Username ExampleAdmin -RoleID ReadOnly -Apply
@@ -47,6 +54,7 @@ param(
     [pscredential]$Credential,
     [switch]$AuditOnly,
     [switch]$ChangePassword,
+    [switch]$CreateIfMissing,
     [switch]$ChangeRole,
     [switch]$DisableUnauthorized,
     [switch]$RemoveUnauthorized,
@@ -94,8 +102,9 @@ if (($ChangePassword -and ($ChangeRole -or $DisableUnauthorized -or $RemoveUnaut
     ($DisableUnauthorized -and $RemoveUnauthorized)) { throw 'Choose only one management mode.' }
 $manage = [bool]($ChangePassword -or $ChangeRole -or $DisableUnauthorized -or $RemoveUnauthorized)
 if ($Apply -and -not $manage) { throw '-Apply requires a management mode.' }
+if ($CreateIfMissing -and -not $ChangePassword) { throw '-CreateIfMissing requires -ChangePassword.' }
 if ($ChangeRole -and -not $RoleID) { throw '-RoleID is required with -ChangeRole.' }
-if ($RoleID -and -not $ChangeRole) { throw '-RoleID requires -ChangeRole.' }
+if ($RoleID -and -not ($ChangeRole -or ($ChangePassword -and $CreateIfMissing))) { throw '-RoleID requires -ChangeRole or -ChangePassword -CreateIfMissing.' }
 if ($manage -and $AuditOnly) { throw '-AuditOnly cannot be combined with a management mode.' }
 if (($DisableUnauthorized -or $RemoveUnauthorized) -and -not ($ApprovedUsers.Count -or $ApprovedUserPatterns.Count)) { throw 'An approved-user allowlist is required.' }
 if ($ChangePassword -or $ChangeRole) {
@@ -103,6 +112,13 @@ if ($ChangePassword -or $ChangeRole) {
     if ([string]::IsNullOrWhiteSpace($Username)) { throw 'Username is required.' }
     $Username = $Username.Trim()
     $newPassword = $null
+    if ($ChangePassword -and $CreateIfMissing -and -not $RoleID) {
+        do {
+            $choice = (Read-Host 'Role for NEW accounts (Administrator, Operator, ReadOnly, None)').Trim()
+            if ($choice -in @('Administrator','Operator','ReadOnly','None')) { $RoleID = $choice; break }
+            Write-Warning 'Enter Administrator, Operator, ReadOnly, or None.'
+        } while ($true)
+    }
     if ($Apply -and $ChangePassword) {
         $newPassword = Read-Host 'New password' -AsSecureString
         $again = Read-Host 'Confirm new password' -AsSecureString
@@ -243,13 +259,176 @@ if ($ChangePassword -or $ChangeRole) {
             if (-not $collectionPath) { throw 'AccountService did not provide Accounts URI.' }
             $collection = Invoke-RedfishGet -HostName $hostName -Path $collectionPath
             $matches = @()
+            $emptySlots = @()
             foreach ($member in @($collection.Members)) {
                 $uri = [string]$member.'@odata.id'
-                if (-not $uri -or -not $uri.StartsWith('/') -or $uri.StartsWith('//') -or $uri.Contains('?') -or $uri.Contains('#')) { continue }
+                if (-not $uri -or $uri -notmatch '^/redfish/v1/AccountService/Accounts/([0-9]+)
+            $accountUri = [string]$matches[0].Uri
+            $beforeRole = [string]$matches[0].Role
+            if ($ChangeRole -and $beforeRole -ceq $RoleID) { $state='AlreadyCompliant'; $afterRole=$beforeRole }
+            elseif (-not $Apply) {
+                $state='WouldChange'
+            } elseif ($PSCmdlet.ShouldProcess("$hostName / $Username", $(if ($ChangeRole) { "Change role to $RoleID" } else { 'Change local iDRAC password' }))) {
+                $url = "https://$hostName$accountUri"
+                $plain=$null; $payload=$null
+                try {
+                    if ($ChangeRole) { $payload=@{RoleId=$RoleID} | ConvertTo-Json -Compress }
+                    else {
+                        $plain=[System.Net.NetworkCredential]::new('', $newPassword).Password
+                        $payload=@{Password=$plain} | ConvertTo-Json -Compress
+                    }
+                    $req=@{Method='Patch';Uri=$url;Headers=$headers;Body=$payload;ContentType='application/json';TimeoutSec=$TimeoutSeconds;ErrorAction='Stop'}
+                    if ($SkipCertificateCheck) { $req.SkipCertificateCheck=$true }
+                    $null=Invoke-RestMethod @req
+                } finally { $plain=$null; $payload=$null }
+                if ($ChangeRole) {
+                    $updated=Invoke-RedfishGet -HostName $hostName -Path $accountUri
+                    $afterRole=[string]$updated.RoleId
+                    if ($afterRole -ceq $RoleID) { $state='Verified' }
+                    else { $state='VerificationMismatch'; $detail="RoleId readback: $afterRole" }
+                } else {
+                    $state='PatchAccepted'
+                    $detail='PATCH accepted; verify authentication separately using new password.'
+                }
+            } else { $state='Skipped' }
+        } catch {
+            $detail=$_.Exception.Message
+        }
+        $passwordResults.Add([pscustomobject]@{Timestamp=(Get-Date).ToString('o');iDRAC=$hostName;Username=$Username;AccountUri=$accountUri;BeforeRoleID=$beforeRole;RequestedRoleID=$(if ($ChangeRole) {$RoleID} else {''});AfterRoleID=$afterRole;Status=$state;Detail=$detail})
+    }
+    $passwordReport = Join-Path $OutputFolder "iDRAC-AccountChange-$runId.csv"
+    $passwordResults | Export-Csv -Path $passwordReport -NoTypeInformation -Encoding UTF8
+    $headers.Clear(); $authString=$null
+    if ($null -ne $newPassword) { $newPassword.Dispose() }
+    Write-Host "Password mode complete. Report: $passwordReport"
+    $passwordResults | Format-Table iDRAC,Username,Status -AutoSize
+    return
+}
+foreach ($hostName in $targets) {
+    Write-Host "Auditing $hostName ..."
+    $count=0; $unapprovedCount=0; $status='Success'; $ipmiState='Unknown'; $slot1Lan='Unknown'; $slot1Serial='Unknown'
+    try {
+        $service = Invoke-RedfishGet -HostName $hostName -Path '/redfish/v1/AccountService'
+        $accountsPath = [string]$service.Accounts.'@odata.id'
+        if (-not $accountsPath) { throw 'AccountService did not return Accounts URI.' }
+        $collection = Invoke-RedfishGet -HostName $hostName -Path $accountsPath
+        $members = @($collection.Members | Where-Object { $_ })
+        # Read Dell OEM attributes once per controller. Missing attributes are reported as Unknown.
+        $oemAttributes = $null
+        try {
+            $oemResponse = Invoke-RedfishGet -HostName $hostName -Path '/redfish/v1/Managers/iDRAC.Embedded.1/Attributes'
+            $oemAttributes = $oemResponse.Attributes
+            $ipmiState = Read-IpmiAttribute $oemAttributes
+            if ($oemAttributes) {
+                $p = $oemAttributes.PSObject.Properties['Users.1.IpmiLanPrivilege']
+                if ($null -ne $p) { $slot1Lan = [string]$p.Value }
+                $p = $oemAttributes.PSObject.Properties['Users.1.IpmiSerialPrivilege']
+                if ($null -ne $p) { $slot1Serial = [string]$p.Value }
+            }
+        } catch {
+            $errors.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Component='IPMIAttributes';Error=$_.Exception.Message})
+        }
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        foreach ($member in $members) {
+            $uri = [string]$member.'@odata.id'
+            if (-not $uri) { continue }
+            $account = Invoke-RedfishGet -HostName $hostName -Path $uri
+            $name = [string]$account.UserName
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            $count++
+            [void]$seen.Add($name)
+            $approved = Test-ApprovedName $name
+            $accountId = [string]$account.Id
+            $lanPrivilege='Unknown'; $serialPrivilege='Unknown'; $solEnabled='Unknown'
+            # Redfish Account Id is expected to match Dell's Users.<slot> attributes on iDRAC9.
+            # Do not guess when the account Id is not a numeric slot.
+            if ($oemAttributes -and $accountId -match '^[0-9]+$') {
+                $slot = [int]$accountId
+                foreach ($entry in @(
+                    @{Key="Users.$slot.IpmiLanPrivilege";Name='Lan'},
+                    @{Key="Users.$slot.IpmiSerialPrivilege";Name='Serial'},
+                    @{Key="Users.$slot.SolEnable";Name='Sol'}
+                )) {
+                    $prop = $oemAttributes.PSObject.Properties[$entry.Key]
+                    if ($null -eq $prop) { continue }
+                    switch ($entry.Name) {
+                        'Lan' { $lanPrivilege = [string]$prop.Value }
+                        'Serial' { $serialPrivilege = [string]$prop.Value }
+                        'Sol' { $solEnabled = [string]$prop.Value }
+                    }
+                }
+            }
+            $inventory.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;AccountId=$accountId;Username=$name;Enabled=$account.Enabled;RoleId=$account.RoleId;IPMILanPrivilege=$lanPrivilege;IPMISerialPrivilege=$serialPrivilege;SerialOverLAN=$solEnabled;IPMIOverLAN=$ipmiState;Approved=$approved;AccountUri=$uri})
+            if (-not $approved) {
+                $unapprovedCount++
+                $unauthorized.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;AccountId=$accountId;Username=$name;Enabled=$account.Enabled;Reason='Not approved'})
+            }
+        }
+        foreach ($required in $ApprovedUsers) {
+            if (-not $seen.Contains($required)) {
+                $missing.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Username=$required;Reason='Required username missing'})
+            }
+        }
+
+    } catch {
+        $status='Failed'
+        $errors.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Component='AccountAudit';Error=$_.Exception.Message})
+    }
+    $ipmi.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;IPMIOverLAN=$ipmiState;ReservedIPMIUser='NotVerified';ReservedSlot1LanPrivilege=$slot1Lan;ReservedSlot1SerialPrivilege=$slot1Serial;Note='Privileges do not establish whether reserved slot 1 is enabled. Reserved account state is not verified.'})
+    $summary.Add([pscustomobject]@{Timestamp=$stamp;iDRAC=$hostName;Status=$status;AccountsFound=$count;UnauthorizedFound=$unapprovedCount;IPMIOverLAN=$ipmiState})
+}
+$exports = @{
+    'iDRAC-AccountInventory'=$inventory
+    'iDRAC-UnauthorizedUsers'=$unauthorized
+    'iDRAC-MissingUsers'=$missing
+    'iDRAC-IPMISecurity'=$ipmi
+    'iDRAC-AuditErrors'=$errors
+    'iDRAC-AuditSummary'=$summary
+}
+foreach ($key in $exports.Keys) {
+    $path = Join-Path $OutputFolder "$key-$runId.csv"
+    if ($exports[$key].Count) { $exports[$key] | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8 }
+    else { 'No records' | Set-Content -Path (Join-Path $OutputFolder "$key-$runId.txt") -Encoding UTF8 }
+}
+$headers.Clear()
+$authString=$null
+Write-Host "Read-only audit complete. Reports: $OutputFolder"
+$summary | Format-Table -AutoSize
+) { continue }
+                $slotId = [int]$Matches[1]
                 $account = Invoke-RedfishGet -HostName $hostName -Path $uri
                 if ([string]$account.UserName -ceq $Username) { $matches += [pscustomobject]@{Uri=$uri;Role=[string]$account.RoleId} }
+                elseif ($slotId -gt 1 -and [string]::IsNullOrWhiteSpace([string]$account.UserName) -and $account.Enabled -eq $false) {
+                    $emptySlots += [pscustomobject]@{Uri=$uri;Slot=$slotId}
+                }
             }
-            if ($matches.Count -ne 1) { throw "Expected exactly one account matching '$Username'; found $($matches.Count)." }
+            if ($matches.Count -gt 1) { throw "Multiple accounts match '$Username'; refusing to modify." }
+            if ($matches.Count -eq 0 -and $ChangePassword -and $CreateIfMissing) {
+                if (-not $emptySlots.Count) { throw 'Account missing and no empty disabled Redfish account slot available.' }
+                $slot = @($emptySlots | Sort-Object Slot | Select-Object -First 1)[0]
+                $accountUri = $slot.Uri
+                if (-not $Apply) {
+                    $state='WouldCreate'; $detail="New account role: $RoleID; empty slot: $($slot.Slot)"
+                } elseif ($PSCmdlet.ShouldProcess("$hostName / $Username / slot $($slot.Slot)", "Create new local account with role $RoleID")) {
+                    $plain = $null; $payload = $null
+                    try {
+                        $plain = [System.Net.NetworkCredential]::new('', $newPassword).Password
+                        $payload = @{UserName=$Username;Password=$plain;RoleId=$RoleID;Enabled=$true} | ConvertTo-Json -Compress
+                        $req = @{Method='Patch';Uri="https://$hostName$accountUri";Headers=$headers;Body=$payload;ContentType='application/json';TimeoutSec=$TimeoutSeconds;ErrorAction='Stop'}
+                        if ($SkipCertificateCheck) { $req.SkipCertificateCheck=$true }
+                        $null = Invoke-RestMethod @req
+                    } finally { $plain=$null; $payload=$null }
+                    $created = Invoke-RedfishGet -HostName $hostName -Path $accountUri
+                    if ([string]$created.UserName -ceq $Username -and $created.Enabled -eq $true -and [string]$created.RoleId -ceq $RoleID) {
+                        $state='VerifiedCreated'; $afterRole=[string]$created.RoleId
+                        $detail='Account properties verified; authenticate separately to verify password.'
+                    } else { $state='VerificationMismatch'; $detail='Created account properties did not match requested values.' }
+                } else { $state='Skipped' }
+            } elseif ($matches.Count -ne 1) { throw "Expected exactly one account matching '$Username'; found $($matches.Count)." }
+            if ($matches.Count -eq 0 -and $ChangePassword -and $CreateIfMissing) {
+                $passwordResults.Add([pscustomobject]@{Timestamp=(Get-Date).ToString('o');iDRAC=$hostName;Username=$Username;AccountUri=$accountUri;BeforeRoleID='';RequestedRoleID=$RoleID;AfterRoleID=$afterRole;Status=$state;Detail=$detail})
+                continue
+            }
             $accountUri = [string]$matches[0].Uri
             $beforeRole = [string]$matches[0].Role
             if ($ChangeRole -and $beforeRole -ceq $RoleID) { $state='AlreadyCompliant'; $afterRole=$beforeRole }
