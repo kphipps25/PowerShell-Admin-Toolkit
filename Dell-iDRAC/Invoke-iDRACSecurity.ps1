@@ -5,14 +5,35 @@
 .DESCRIPTION
   Audits local Redfish accounts by username, checks an approved-user allowlist,
   and attempts to read the Dell IPMI-over-LAN setting. Audit mode never modifies iDRAC.
-  -ChangePassword or -ChangeRole selects a separate management mode; -Apply is required to write.
+  -ChangePassword, -ChangeRole, -DisableUnauthorized or -RemoveUnauthorized select
+  separate management modes. -Apply is required to write. Default audit is read-only.
   Reports per-account IPMI LAN/serial privilege and SOL setting when Dell OEM
   Users.<slot> attributes are exposed. Missing values are Unknown, not Disabled.
   Reserved IPMI slot 1 is reported NotVerified (not inferred from Redfish).
 .EXAMPLE
-  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01.example.com -ApprovedUsers root,ExampleAdmin -ApprovedUserPatterns 'OME_*'
+  # Read-only audit for one controller.
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,umpquaadmin -ApprovedUserPatterns 'OME_*'
 .EXAMPLE
-  .\Invoke-iDRACSecurity.ps1 -ComputerList .\Examples\iDRAC-Servers.txt -ApprovedUsersFile .\Examples\ApprovedUsers.txt -Credential (Get-Credential)
+  # Read-only audit from CSV (CSV header must be iDRAC).
+  .\Invoke-iDRACSecurity.ps1 -InputCsv .\iDRAC_List.csv -ApprovedUsers root,umpquaadmin -ApprovedUserPatterns 'OME_*' -SkipCertificateCheck
+.EXAMPLE
+  # Preview password change, then add -Apply to change it (prompts for username/password).
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ChangePassword -Username umpquaadmin
+.EXAMPLE
+  # Change account role; omit -Apply for preview.
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ChangeRole -Username umpquaadmin -RoleID ReadOnly -Apply
+.EXAMPLE
+  # Preview disabling unapproved users; no changes without -Apply.
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,umpquaadmin,SNMPv3User,forescoutscan -ApprovedUserPatterns 'OME_*' -DisableUnauthorized
+.EXAMPLE
+  # Disable unapproved users on one controller (prompts for each change).
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,umpquaadmin,SNMPv3User,forescoutscan -ApprovedUserPatterns 'OME_*' -DisableUnauthorized -Apply
+.EXAMPLE
+  # Preview permanent removal; -Apply is required and prompts for each account.
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,umpquaadmin,SNMPv3User,forescoutscan -ApprovedUserPatterns 'OME_*' -RemoveUnauthorized
+.EXAMPLE
+  # Permanently remove unauthorized users on one controller (review preview first).
+  .\Invoke-iDRACSecurity.ps1 -iDRAC idrac01 -ApprovedUsers root,umpquaadmin,SNMPv3User,forescoutscan -ApprovedUserPatterns 'OME_*' -RemoveUnauthorized -Apply
 #>
 [CmdletBinding(DefaultParameterSetName='Single',SupportsShouldProcess=$true,ConfirmImpact='High')]
 param(
@@ -26,6 +47,8 @@ param(
     [switch]$AuditOnly,
     [switch]$ChangePassword,
     [switch]$ChangeRole,
+    [switch]$DisableUnauthorized,
+    [switch]$RemoveUnauthorized,
     [ValidateSet('Administrator','Operator','ReadOnly','None')][string]$RoleID,
     [switch]$Apply,
     [string]$Username,
@@ -64,12 +87,17 @@ foreach ($target in $targets) {
 if ($SkipCertificateCheck -and $PSVersionTable.PSVersion.Major -lt 7) { throw '-SkipCertificateCheck requires PowerShell 7 or later.' }
 if ($SkipCertificateCheck) { Write-Warning 'TLS certificate validation is disabled for this run. Use only on trusted management networks.' }
 if (-not $Credential) { $Credential = Get-Credential -Message 'iDRAC audit credential' }
-# Password changes are a separate mode. Default audit remains read-only.
-if ($ChangePassword -and $ChangeRole) { throw 'Choose one management mode.' }
-if ($Apply -and -not ($ChangePassword -or $ChangeRole)) { throw '-Apply requires a management mode.' }
+# All write operations are explicitly selected and require -Apply.
+$managementModes = @($ChangePassword, $ChangeRole, $DisableUnauthorized, $RemoveUnauthorized | Where-Object { $_ })
+if (($ChangePassword -and ($ChangeRole -or $DisableUnauthorized -or $RemoveUnauthorized)) -or
+    ($ChangeRole -and ($DisableUnauthorized -or $RemoveUnauthorized)) -or
+    ($DisableUnauthorized -and $RemoveUnauthorized)) { throw 'Choose only one management mode.' }
+$manage = [bool]($ChangePassword -or $ChangeRole -or $DisableUnauthorized -or $RemoveUnauthorized)
+if ($Apply -and -not $manage) { throw '-Apply requires a management mode.' }
 if ($ChangeRole -and -not $RoleID) { throw '-RoleID is required with -ChangeRole.' }
 if ($RoleID -and -not $ChangeRole) { throw '-RoleID requires -ChangeRole.' }
-if (($ChangePassword -or $ChangeRole) -and $AuditOnly) { throw '-AuditOnly cannot be combined with -ChangePassword.' }
+if ($manage -and $AuditOnly) { throw '-AuditOnly cannot be combined with a management mode.' }
+if (($DisableUnauthorized -or $RemoveUnauthorized) -and -not ($ApprovedUsers.Count -or $ApprovedUserPatterns.Count)) { throw 'An approved-user allowlist is required.' }
 if ($ChangePassword -or $ChangeRole) {
     if (-not $Username) { $Username = Read-Host 'Local iDRAC username to update' }
     if ([string]::IsNullOrWhiteSpace($Username)) { throw 'Username is required.' }
@@ -131,6 +159,60 @@ function Read-IpmiAttribute {
         }
     }
     return 'Unknown'
+}
+if ($DisableUnauthorized -or $RemoveUnauthorized) {
+    $action = if ($DisableUnauthorized) { 'Disable' } else { 'Remove' }
+    $cleanup = [System.Collections.Generic.List[object]]::new()
+    foreach ($hostName in $targets) {
+        Write-Host "Reviewing unauthorized accounts on $hostName ..."
+        try {
+            $service = Invoke-RedfishGet -HostName $hostName -Path '/redfish/v1/AccountService'
+            $accountsPath = [string]$service.Accounts.'@odata.id'
+            if (-not $accountsPath) { throw 'AccountService did not provide Accounts URI.' }
+            $collection = Invoke-RedfishGet -HostName $hostName -Path $accountsPath
+            foreach ($member in @($collection.Members)) {
+                $uri = [string]$member.'@odata.id'
+                if (-not $uri -or $uri -notmatch '^/redfish/v1/AccountService/Accounts/[0-9]+$') { continue }
+                $account = Invoke-RedfishGet -HostName $hostName -Path $uri
+                $name = [string]$account.UserName
+                if ([string]::IsNullOrWhiteSpace($name) -or (Test-ApprovedName $name)) { continue }
+                $accountId = [string]$account.Id
+                $state = 'WouldChange'; $detail = ''
+                # Never alter root, the login account, or reserved slot 1, even if missing from allowlist.
+                if ($name -ieq 'root' -or $name -ieq $Credential.UserName -or $accountId -eq '1') {
+                    $state = 'Protected'; $detail = 'Protected root, current login, or reserved account slot.'
+                } elseif ($DisableUnauthorized -and $account.Enabled -eq $false) {
+                    $state = 'AlreadyDisabled'
+                } elseif ($Apply) {
+                    try {
+                        if ($PSCmdlet.ShouldProcess("$hostName / $name / $accountId", "$action unauthorized local account")) {
+                            $request = @{Method=$(if ($DisableUnauthorized) {'Patch'} else {'Delete'});Uri="https://$hostName$uri";Headers=$headers;TimeoutSec=$TimeoutSeconds;ErrorAction='Stop'}
+                            if ($DisableUnauthorized) { $request.Body = '{"Enabled":false}'; $request.ContentType='application/json' }
+                            if ($SkipCertificateCheck) { $request.SkipCertificateCheck=$true }
+                            $null = Invoke-RestMethod @request
+                            if ($DisableUnauthorized) {
+                                $check = Invoke-RedfishGet -HostName $hostName -Path $uri
+                                if ($check.Enabled -eq $false) { $state='VerifiedDisabled' }
+                                else { $state='VerificationFailed'; $detail='Account still enabled after PATCH.' }
+                            } else {
+                                $state='DeleteAccepted'
+                                $detail='DELETE accepted; independently confirm account is absent.'
+                            }
+                        } else { $state='Skipped' }
+                    } catch { $state='Failed'; $detail=$_.Exception.Message }
+                }
+                $cleanup.Add([pscustomobject]@{Timestamp=(Get-Date).ToString('o');iDRAC=$hostName;AccountId=$accountId;Username=$name;Action=$action;Status=$state;Detail=$detail})
+            }
+        } catch {
+            $cleanup.Add([pscustomobject]@{Timestamp=(Get-Date).ToString('o');iDRAC=$hostName;AccountId='';Username='';Action=$action;Status='Failed';Detail=$_.Exception.Message})
+        }
+    }
+    $report = Join-Path $OutputFolder "iDRAC-Unauthorized-$action-$runId.csv"
+    $cleanup | Export-Csv -LiteralPath $report -NoTypeInformation -Encoding UTF8
+    $headers.Clear(); $authString=$null
+    Write-Host "Unauthorized account $action report: $report"
+    $cleanup | Format-Table iDRAC,Username,Action,Status -AutoSize
+    return
 }
 if ($ChangePassword -or $ChangeRole) {
     $passwordResults = [System.Collections.Generic.List[object]]::new()
