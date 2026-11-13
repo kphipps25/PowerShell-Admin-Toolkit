@@ -144,7 +144,12 @@ try {
    do {
     $liveJob = Get-SCJob -VMMServer $vmm -ID $jobId -ErrorAction Stop
     $jobStatus = [string](PropertyValue $liveJob 'Status')
-    if ($jobStatus -match '^(Completed|Succeeded)
+    if ($jobStatus -match '^(Completed|Succeeded)$') { break }
+    if ($jobStatus -match '^(Failed|Canceled|Cancelled)$') { throw "SCVMM catalog synchronization ended with status '$jobStatus'. Baseline unchanged." }
+    if ((Get-Date) -ge $deadline) { throw "Synchronization did not finish within $SynchronizationTimeoutMinutes minutes. Baseline unchanged." }
+    Start-Sleep -Seconds 15
+   } while ($true)
+   Write-Host 'SCVMM catalog synchronization completed.'
   } else {
    Write-Host 'AuditOnly: skipping synchronization (read-only).'
   }
@@ -172,149 +177,6 @@ try {
  SaveRows 'Plan' $plan
  Write-Host "Candidates: add=$($adds.Count), remove=$($removes.Count), retained-superseded=$($retained.Count), excluded=$($excluded.Count)"
  Write-Host 'Review ExcludedCandidates.csv before applying; title/classification filtering is conservative.'
- if (-not $Apply) { Write-Host 'AUDIT ONLY: No changes made.'; return }
-
- # Re-read baseline to avoid overwriting changes made while catalog was being examined.
- $current = Get-SCBaseline -VMMServer $vmm -Name $BaselineName -ErrorAction Stop
- $currentIds = @((BaselineUpdates $current) | ForEach-Object { UpdateId $_ } | Sort-Object)
- $expectedIds = @($originalIds.Keys | Sort-Object)
- if ((Compare-Object $currentIds $expectedIds).Count -gt 0) { throw 'Baseline changed during planning. No changes applied.' }
- foreach($u in $adds) {
-  Set-SCBaseline -VMMServer $vmm -Baseline $current -AddUpdates $u -ErrorAction Stop | Out-Null
-  $current = Get-SCBaseline -VMMServer $vmm -Name $BaselineName -ErrorAction Stop
-  if ((UpdateId $u) -notin @((BaselineUpdates $current) | ForEach-Object { UpdateId $_ })) { throw "Failed to verify addition: $(UpdateTitle $u)" }
-  Write-Host "ADDED: $(UpdateTitle $u)"
- }
- foreach($u in $removes) {
-  $current = Get-SCBaseline -VMMServer $vmm -Name $BaselineName -ErrorAction Stop
-  $idsNow = @((BaselineUpdates $current) | ForEach-Object { UpdateId $_ })
-  $replacement = @(ReplacementIds $u | Where-Object { $_ -in $idsNow -and $eligibleIds.ContainsKey($_) })
-  if ($replacement.Count -eq 0) { Write-Warning "Retaining $(UpdateTitle $u): replacement not present"; continue }
-  Set-SCBaseline -VMMServer $vmm -Baseline $current -RemoveUpdates $u -ErrorAction Stop | Out-Null
-  Write-Host "REMOVED: $(UpdateTitle $u)"
- }
- Write-Host 'Baseline changes completed. No update remediation was requested.'
- if (-not $SkipComplianceScan) {
-  # Do not guess host-group inheritance; scan the baseline's explicitly assigned clusters.
-  $current = Get-SCBaseline -VMMServer $vmm -Name $BaselineName -ErrorAction Stop
-  $scopes = PropertyValue $current 'AssignmentScope'
-  if ($null -eq $scopes) { $scopes = PropertyValue $current 'AssignmentScopes' }
-  if ($null -eq $scopes) {
-   Write-Warning 'Assignment scope property unavailable. Skipping scans; use VMM console to scan assigned hosts.'
-  } else {
-   foreach($scope in @($scopes)) {
-    if ($scope.GetType().Name -match 'HostCluster') {
-     try { Start-SCComplianceScan -VMMServer $vmm -VMHostCluster $scope -Baseline $current -ErrorAction Stop | Out-Null; Write-Host "SCANNED cluster: $($scope.Name)" }
-     catch { Write-Warning "Scan failed for $($scope.Name): $_" }
-    } else { Write-Warning "Scope '$($scope.Name)' is not a cluster object; scan manually or extend discovery after validating host-group inheritance." }
-   }
-  }
- }
-} catch {
- Write-Error "Stopped: $($_.Exception.Message)"
- exit 1
-} finally {
- if ($transcriptStarted) { Stop-Transcript | Out-Null }
-}
-) { break }
-    if ($jobStatus -match '^(Failed|Canceled|Cancelled)
-  } else {
-   Write-Host 'AuditOnly: skipping synchronization (read-only).'
-  }
- }
- $catalog = @(Get-SCUpdate -VMMServer $vmm -ErrorAction Stop)
- $eligible = @($catalog | Where-Object { IsEligible $_ })
- $eligibleIds = @{}; foreach($u in $eligible) { $eligibleIds[(UpdateId $u)] = $true }
- $adds = @($eligible | Where-Object { -not $originalIds.ContainsKey((UpdateId $_)) -and -not (IsSuperseded $_) })
- $addIds = @{}; foreach($u in $adds) { $addIds[(UpdateId $u)] = $true }
- $removes = @()
- $retained = @()
- foreach($u in $original) {
-  if (-not (IsSuperseded $u)) { continue }
-  $replacements = @(ReplacementIds $u)
-  $verified = @($replacements | Where-Object { $eligibleIds.ContainsKey($_) -and ($originalIds.ContainsKey($_) -or $addIds.ContainsKey($_)) })
-  if ($verified.Count -gt 0) { $removes += $u }
-  else { $retained += $u }
- }
- $plan = @()
- foreach($u in $adds) { $plan += [pscustomobject]@{Action='Add';ID=UpdateId $u;KB=KBText $u;Name=UpdateTitle $u;Reason='Eligible, not superseded'} }
- foreach($u in $removes) { $plan += [pscustomobject]@{Action='Remove';ID=UpdateId $u;KB=KBText $u;Name=UpdateTitle $u;Reason='Explicit replacement relationship found'} }
- foreach($u in $retained) { $plan += [pscustomobject]@{Action='Retain';ID=UpdateId $u;KB=KBText $u;Name=UpdateTitle $u;Reason='Replacement not verifiable; do not remove'} }
- SaveRows 'Plan' $plan
- Write-Host "Candidates: add=$($adds.Count), remove=$($removes.Count), retained-superseded=$($retained.Count)"
- if (-not $Apply) { Write-Host 'AUDIT ONLY: No changes made.'; return }
-
- # Re-read baseline to avoid overwriting changes made while catalog was being examined.
- $current = Get-SCBaseline -VMMServer $vmm -Name $BaselineName -ErrorAction Stop
- $currentIds = @((BaselineUpdates $current) | ForEach-Object { UpdateId $_ } | Sort-Object)
- $expectedIds = @($originalIds.Keys | Sort-Object)
- if ((Compare-Object $currentIds $expectedIds).Count -gt 0) { throw 'Baseline changed during planning. No changes applied.' }
- foreach($u in $adds) {
-  Set-SCBaseline -VMMServer $vmm -Baseline $current -AddUpdates $u -ErrorAction Stop | Out-Null
-  $current = Get-SCBaseline -VMMServer $vmm -Name $BaselineName -ErrorAction Stop
-  if ((UpdateId $u) -notin @((BaselineUpdates $current) | ForEach-Object { UpdateId $_ })) { throw "Failed to verify addition: $(UpdateTitle $u)" }
-  Write-Host "ADDED: $(UpdateTitle $u)"
- }
- foreach($u in $removes) {
-  $current = Get-SCBaseline -VMMServer $vmm -Name $BaselineName -ErrorAction Stop
-  $idsNow = @((BaselineUpdates $current) | ForEach-Object { UpdateId $_ })
-  $replacement = @(ReplacementIds $u | Where-Object { $_ -in $idsNow -and $eligibleIds.ContainsKey($_) })
-  if ($replacement.Count -eq 0) { Write-Warning "Retaining $(UpdateTitle $u): replacement not present"; continue }
-  Set-SCBaseline -VMMServer $vmm -Baseline $current -RemoveUpdates $u -ErrorAction Stop | Out-Null
-  Write-Host "REMOVED: $(UpdateTitle $u)"
- }
- Write-Host 'Baseline changes completed. No update remediation was requested.'
- if (-not $SkipComplianceScan) {
-  # Do not guess host-group inheritance; scan the baseline's explicitly assigned clusters.
-  $current = Get-SCBaseline -VMMServer $vmm -Name $BaselineName -ErrorAction Stop
-  $scopes = PropertyValue $current 'AssignmentScope'
-  if ($null -eq $scopes) { $scopes = PropertyValue $current 'AssignmentScopes' }
-  if ($null -eq $scopes) {
-   Write-Warning 'Assignment scope property unavailable. Skipping scans; use VMM console to scan assigned hosts.'
-  } else {
-   foreach($scope in @($scopes)) {
-    if ($scope.GetType().Name -match 'HostCluster') {
-     try { Start-SCComplianceScan -VMMServer $vmm -VMHostCluster $scope -Baseline $current -ErrorAction Stop | Out-Null; Write-Host "SCANNED cluster: $($scope.Name)" }
-     catch { Write-Warning "Scan failed for $($scope.Name): $_" }
-    } else { Write-Warning "Scope '$($scope.Name)' is not a cluster object; scan manually or extend discovery after validating host-group inheritance." }
-   }
-  }
- }
-} catch {
- Write-Error "Stopped: $($_.Exception.Message)"
- exit 1
-} finally {
- if ($transcriptStarted) { Stop-Transcript | Out-Null }
-}
-) { throw "SCVMM catalog synchronization ended with status '$jobStatus'. Baseline unchanged." }
-    if ((Get-Date) -ge $deadline) { throw "Synchronization did not finish within $SynchronizationTimeoutMinutes minutes. Baseline unchanged." }
-    Start-Sleep -Seconds 15
-   } while ($true)
-   Write-Host 'SCVMM catalog synchronization completed.'
-  } else {
-   Write-Host 'AuditOnly: skipping synchronization (read-only).'
-  }
- }
- $catalog = @(Get-SCUpdate -VMMServer $vmm -ErrorAction Stop)
- $eligible = @($catalog | Where-Object { IsEligible $_ })
- $eligibleIds = @{}; foreach($u in $eligible) { $eligibleIds[(UpdateId $u)] = $true }
- $adds = @($eligible | Where-Object { -not $originalIds.ContainsKey((UpdateId $_)) -and -not (IsSuperseded $_) })
- $addIds = @{}; foreach($u in $adds) { $addIds[(UpdateId $u)] = $true }
- $removes = @()
- $retained = @()
- foreach($u in $original) {
-  if (-not (IsSuperseded $u)) { continue }
-  $replacements = @(ReplacementIds $u)
-  $verified = @($replacements | Where-Object { $eligibleIds.ContainsKey($_) -and ($originalIds.ContainsKey($_) -or $addIds.ContainsKey($_)) })
-  if ($verified.Count -gt 0) { $removes += $u }
-  else { $retained += $u }
- }
- $plan = @()
- foreach($u in $adds) { $plan += [pscustomobject]@{Action='Add';ID=UpdateId $u;KB=KBText $u;Name=UpdateTitle $u;Reason='Eligible, not superseded'} }
- foreach($u in $removes) { $plan += [pscustomobject]@{Action='Remove';ID=UpdateId $u;KB=KBText $u;Name=UpdateTitle $u;Reason='Explicit replacement relationship found'} }
- foreach($u in $retained) { $plan += [pscustomobject]@{Action='Retain';ID=UpdateId $u;KB=KBText $u;Name=UpdateTitle $u;Reason='Replacement not verifiable; do not remove'} }
- SaveRows 'Plan' $plan
- Write-Host "Candidates: add=$($adds.Count), remove=$($removes.Count), retained-superseded=$($retained.Count)"
  if (-not $Apply) { Write-Host 'AUDIT ONLY: No changes made.'; return }
 
  # Re-read baseline to avoid overwriting changes made while catalog was being examined.
